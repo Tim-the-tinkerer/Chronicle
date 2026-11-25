@@ -58,6 +58,9 @@ enum SelfTest {
             testSymlinkDoesNotHideTheNextFolder,
             testMissingDirectoryRecordIsNamed,
             testMenuBarStatusLines,
+            testVersionDaysGroupPreviousDays,
+            testThinningSaysWhatItRemoved,
+            testThinningHistoryTotalsSinceLoggingBegan,
         ]
         for test in tests {
             if let error = test() { return error }
@@ -2417,7 +2420,17 @@ enum SelfTest {
             try FileManager.default.createDirectory(at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("orphan".utf8).write(to: orphan)
             let removed = try Vault.prune(vault: vault, now: now)
-            if removed != 1 { return "retention: removed \(removed)" }
+            if removed.count != 1 { return "retention: removed \(removed.count)" }
+            if removed.removed.map(\.id) != [extra] {
+                return "retention: dropped \(removed.removed.map(\.id))"
+            }
+            if removed.freed != 6 || !removed.complete {
+                return "retention: freed \(removed.freed) complete \(removed.complete)"
+            }
+            let told = ThinText.sentence(names: ThinText.names(removed), freed: removed.freed, complete: removed.complete)
+            if !told.hasPrefix("Removed ") || !told.contains("Freed 6 B.") {
+                return "retention: the note was \(told)"
+            }
             let left = Set(try Vault.listHeads(vault).map(\.id))
             if !left.contains(snap.id) || !left.contains(old) || left.contains(extra) {
                 return "retention: versions were \(left.sorted())"
@@ -2495,7 +2508,9 @@ enum SelfTest {
             if chmod(extraURL.path, 0o000) != 0 { return "pin: could not hide a version body" }
             if chmod(hiddenHead.path, 0o000) != 0 { return "pin: could not hide a head" }
             let removed = try Vault.prune(vault: vault, now: now)
-            if removed != 1 { return "pin: removed \(removed)" }
+            if removed.count != 1 || removed.removed.first?.id != extra {
+                return "pin: removed \(removed.removed.map(\.id))"
+            }
             _ = chmod(hiddenHead.path, 0o644)
             let left = Set(try Vault.listHeads(vault).map(\.id))
             for id in [snap.id, old, labeled, manual, hidden] where !left.contains(id) {
@@ -2785,6 +2800,322 @@ enum SelfTest {
         case S_IFLNK: return "link"
         default: return "other"
         }
+    }
+
+    /// The newest day stays open. Earlier days are separate rows and start collapsed.
+    private static func testVersionDaysGroupPreviousDays() -> String? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var parts = DateComponents()
+        parts.calendar = calendar
+        parts.timeZone = calendar.timeZone
+        parts.year = 2026
+        parts.month = 11
+        parts.day = 21
+        parts.hour = 15
+        guard let now = calendar.date(from: parts) else { return "days: no clock" }
+        let alone = VersionDays.group(
+            [versionHead("2026-11-21T14:00:00.000Z", "20261121-140000-aaaaaaaa")],
+            now: now,
+            calendar: calendar
+        )
+        if alone.count != 1 || !alone[0].opensFlat || alone[0].showsHeader || alone[0].title != "Today" {
+            return "days: one day was \(alone.map { "\($0.title) flat=\($0.opensFlat) header=\($0.showsHeader)" })"
+        }
+        let heads = [
+            versionHead("2026-11-21T14:00:00.000Z", "20261121-140000-aaaaaaaa"),
+            versionHead("2026-11-21T09:00:00.000Z", "20261121-090000-aaaaaaab"),
+            versionHead("2026-11-20T18:00:00.000Z", "20261120-180000-aaaaaaac"),
+            versionHead("2026-11-18T12:00:00.000Z", "20261118-120000-aaaaaaad"),
+            versionHead("nope", "20261119-080000-aaaaaaae"),
+            versionHead("still-nope", "not-an-id"),
+        ]
+        let days = VersionDays.group(heads, now: now, calendar: calendar)
+        if days.map(\.id) != ["2026-11-21", "2026-11-20", "2026-11-19", "2026-11-18", "other"] {
+            return "days: order was \(days.map(\.id))"
+        }
+        if days.map(\.title) != ["Today", "Yesterday", days[2].title, days[3].title, "Other"] {
+            return "days: titles were \(days.map(\.title))"
+        }
+        if !days[2].title.contains("19") || !days[2].title.contains("2026") {
+            return "days: an older day was titled \(days[2].title)"
+        }
+        if !days[3].title.contains("18") || !days[3].title.contains("2026") {
+            return "days: the oldest day was titled \(days[3].title)"
+        }
+        if !days[0].opensFlat || days[0].heads.map(\.id) != ["20261121-140000-aaaaaaaa", "20261121-090000-aaaaaaab"] {
+            return "days: today did not stay open in order"
+        }
+        if days.dropFirst().contains(where: \.opensFlat) {
+            return "days: an earlier day stayed open"
+        }
+        if days.contains(where: { !$0.showsHeader }) {
+            return "days: a divided list hid its day title"
+        }
+        if days[4].heads.map(\.id) != ["not-an-id"] {
+            return "days: an undated version was \(days[4].heads.map(\.id))"
+        }
+        return nil
+    }
+
+    /// Thinning names the versions it removed and says whether that freed any unique bytes.
+    private static func testThinningSaysWhatItRemoved() -> String? {
+        func line(_ names: [String], _ freed: Int64, _ complete: Bool = true) -> String {
+            ThinText.sentence(names: names, freed: freed, complete: complete)
+        }
+        let one = line(["Nov 1"], 6)
+        if one != "Removed Nov 1. Freed 6 B." { return "thin-note: one was \(one)" }
+        let shared = line(["Nov 1"], 0)
+        if shared != "Removed Nov 1. Freed nothing. The kept versions still use those bytes." {
+            return "thin-note: shared bytes were \(shared)"
+        }
+        let pair = line(["Nov 1", "Nov 2"], 12)
+        if pair != "Removed Nov 1 and Nov 2. Freed 12 B." { return "thin-note: two were \(pair)" }
+        let three = line(["Nov 1", "Nov 2", "Nov 3"], 10)
+        if three != "Removed Nov 1, Nov 2, and Nov 3. Freed 10 B." { return "thin-note: three were \(three)" }
+        let four = line(["A", "B", "C", "D"], 1)
+        if four != "Removed A, B, C, and D. Freed 1 B." { return "thin-note: four were \(four)" }
+        let span = line(["A", "B", "C", "D", "E"], 0)
+        if span != "Removed 5 older versions, from A through E. Freed nothing. The kept versions still use those bytes." {
+            return "thin-note: a long list was \(span)"
+        }
+        let blocked = line(["Nov 1"], 6, false)
+        if blocked != "Removed Nov 1. A version could not be read, so unused chunks were left in place." {
+            return "thin-note: an unfinished pass was \(blocked)"
+        }
+        if blocked.contains("Freed") { return "thin-note: an unfinished pass claimed space" }
+        let blank = line([], 4)
+        if blank != "Removed older versions. Freed 4 B." { return "thin-note: unnamed versions were \(blank)" }
+
+        let unnamed = PruneResult(
+            removed: [PrunedVersion(id: "20261001-120000-aaaaaaaa", created: nil)],
+            freed: 0,
+            complete: true
+        )
+        if ThinText.names(unnamed) != ["an older version"] {
+            return "thin-note: a missing time was \(ThinText.names(unnamed))"
+        }
+        let quiet = ThinText.report([("Notes", .none)], nameEach: true)
+        if !quiet.isEmpty { return "thin-note: an empty pass said \(quiet)" }
+        let alone = ThinText.report([("Notes", unnamed)], nameEach: false)
+        if alone != "Removed an older version. Freed nothing. The kept versions still use those bytes." {
+            return "thin-note: one folder was \(alone)"
+        }
+        if alone.contains("Notes:") { return "thin-note: one folder was named twice" }
+        let folders = ThinText.report([
+            ("Notes", unnamed),
+            ("Quiet", .none),
+            ("Photos", PruneResult(
+                removed: [
+                    PrunedVersion(id: "20261001-120000-aaaaaaa1", created: nil),
+                    PrunedVersion(id: "20261002-120000-aaaaaaa2", created: nil),
+                ],
+                freed: 6,
+                complete: true
+            )),
+        ], nameEach: true)
+        let wanted = "Notes: Removed an older version. Freed nothing. The kept versions still use those bytes. Photos: Removed an older version and an older version. Freed 6 B."
+        if folders != wanted { return "thin-note: folders were \(folders)" }
+
+        let now = utcDate(year: 2026, month: 11, day: 21, hour: 12, minute: 30, second: 0)
+        let root = temp("thin-note")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            try Data("note".utf8).write(to: source.appendingPathComponent("note.txt"))
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "thin-note: no version"
+            }
+            let firstID = "20261001-180000-bbbbbbb2"
+            let secondID = "20261002-180000-bbbbbbb3"
+            try copyManifest(vault, from: snap.id, to: "20261001-120000-bbbbbbb1", created: "2026-10-01T12:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: firstID, created: "2026-10-01T18:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: "20261002-120000-bbbbbbb4", created: "2026-10-02T12:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: secondID, created: "2026-10-02T18:00:00.000Z")
+            let orphan = chunkFile(vault, String(repeating: "cd", count: 32))
+            try FileManager.default.createDirectory(at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("orphan".utf8).write(to: orphan)
+            let removed = try Vault.prune(vault: vault, now: now)
+            if removed.removed.map(\.id) != [firstID, secondID] {
+                return "thin-note: dropped \(removed.removed.map(\.id))"
+            }
+            if removed.freed != 6 || !removed.complete {
+                return "thin-note: freed \(removed.freed) complete \(removed.complete)"
+            }
+            guard let firstDate = TimeText.parse("2026-10-01T18:00:00.000Z"),
+                  let secondDate = TimeText.parse("2026-10-02T18:00:00.000Z") else {
+                return "thin-note: a removed time did not parse"
+            }
+            let names = [TimeText.display(firstDate), TimeText.display(secondDate)]
+            if ThinText.names(removed) != names {
+                return "thin-note: names were \(ThinText.names(removed))"
+            }
+            let told = ThinText.sentence(names: names, freed: removed.freed, complete: removed.complete)
+            if told != "Removed \(names[0]) and \(names[1]). Freed 6 B." {
+                return "thin-note: the history said \(told)"
+            }
+            if FileManager.default.fileExists(atPath: orphan.path) {
+                return "thin-note: an unused chunk stayed"
+            }
+            return nil
+        } catch {
+            return "thin-note: \(error.localizedDescription)"
+        }
+    }
+
+    /// Each folder records the passes that removed versions, and a total from the first of those passes.
+    private static func testThinningHistoryTotalsSinceLoggingBegan() -> String? {
+        let when = utcDate(year: 2026, month: 11, day: 21, hour: 12, minute: 30, second: 0)
+        var log = ThinningLog.empty
+        if log.recording(.none, at: when) != log { return "thin-log: an empty pass was stored" }
+        let kept = PruneResult(
+            removed: [PrunedVersion(id: "20261001-180000-bbbbbbb2", created: when)],
+            freed: 6,
+            complete: true
+        )
+        log = log.recording(kept, at: when)
+        if log.removed != 1 || log.freed != 6 || log.passes.count != 1 || log.since != TimeText.nowISO(when) {
+            return "thin-log: the first pass was \(log.removed) \(log.freed) \(log.since)"
+        }
+        let blocked = PruneResult(
+            removed: [PrunedVersion(id: "20261002-180000-bbbbbbb3", created: nil)],
+            freed: 50,
+            complete: false
+        )
+        log = log.recording(blocked, at: when.addingTimeInterval(60))
+        if log.removed != 2 || log.freed != 6 || log.passes.first?.freed != 0 || log.passes.first?.complete != false {
+            return "thin-log: an unfinished pass changed the total to \(log.freed)"
+        }
+        if log.since != TimeText.nowISO(when) { return "thin-log: logging began again" }
+        if ThinText.names(log.passes[0]) != ["an older version"] {
+            return "thin-log: a missing time was \(ThinText.names(log.passes[0]))"
+        }
+        let one = ThinningText.total(ThinningLog(since: TimeText.nowISO(when), removed: 1, freed: 6, passes: []))
+        if one != "\(TimeText.day(when)) · 1 version · Freed 6 B" {
+            return "thin-log: one version totaled \(one)"
+        }
+        let none = ThinningText.total(ThinningLog(since: "", removed: 2, freed: 0, passes: []))
+        if none != "2 versions · Freed nothing" { return "thin-log: a shared total was \(none)" }
+
+        var capped = ThinningLog.empty
+        let start = utcDate(year: 2026, month: 1, day: 1, hour: 0, minute: 0, second: 0)
+        let extra = ThinningLog.keptPasses + 1
+        for index in 0..<extra {
+            let at = start.addingTimeInterval(TimeInterval(index))
+            let id = String(format: "20260101-000000-%08x", index)
+            capped = capped.recording(
+                PruneResult(removed: [PrunedVersion(id: id, created: at)], freed: 2, complete: true),
+                at: at
+            )
+        }
+        if capped.passes.count != ThinningLog.keptPasses || capped.removed != extra || capped.freed != Int64(extra * 2) {
+            return "thin-log: the capped total was \(capped.passes.count) \(capped.removed) \(capped.freed)"
+        }
+        if capped.since != TimeText.nowISO(start) { return "thin-log: the first day was \(capped.since)" }
+        let oldest = String(format: "20260101-000000-%08x", 0)
+        let newest = String(format: "20260101-000000-%08x", extra - 1)
+        if capped.passes.contains(where: { $0.versions.contains { $0.id == oldest } }) {
+            return "thin-log: the oldest pass stayed in the list"
+        }
+        if capped.passes.first?.versions.first?.id != newest {
+            return "thin-log: the newest pass was \(capped.passes.first?.versions.first?.id ?? "missing")"
+        }
+
+        let blank = temp("thin-log-blank")
+        defer { try? FileManager.default.removeItem(at: blank) }
+        let untouched = Vault.thinningHistory(blank)
+        if !untouched.readable || untouched.log.removed != 0 { return "thin-log: a new folder already had a total" }
+
+        let now = when
+        let root = temp("thin-log")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        let moved = root.appendingPathComponent("moved")
+        do {
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            try Data("note".utf8).write(to: source.appendingPathComponent("note.txt"))
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "thin-log: no version"
+            }
+            let firstID = "20261001-180000-bbbbbbb2"
+            let secondID = "20261002-180000-bbbbbbb3"
+            let thirdID = "20261003-180000-bbbbbbb4"
+            try copyManifest(vault, from: snap.id, to: "20261001-120000-bbbbbbb1", created: "2026-10-01T12:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: firstID, created: "2026-10-01T18:00:00.000Z")
+            let orphan = chunkFile(vault, String(repeating: "ef", count: 32))
+            try FileManager.default.createDirectory(at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("orphan".utf8).write(to: orphan)
+            _ = try Vault.prune(vault: vault, now: now)
+            var history = Vault.thinningHistory(vault)
+            if !history.readable || history.log.removed != 1 || history.log.freed != 6 || history.log.passes.count != 1 {
+                return "thin-log: the file was \(history.readable) \(history.log.removed) \(history.log.freed)"
+            }
+            if history.log.passes[0].versions.map(\.id) != [firstID] {
+                return "thin-log: logged \(history.log.passes[0].versions.map(\.id))"
+            }
+            if history.log.since != TimeText.nowISO(now) { return "thin-log: since was \(history.log.since)" }
+            guard let created = history.log.passes[0].versions[0].created,
+                  let parsed = TimeText.parse(created),
+                  let expected = TimeText.parse("2026-10-01T18:00:00.000Z"),
+                  parsed == expected else {
+                return "thin-log: the removed time was \(history.log.passes[0].versions[0].created ?? "missing")"
+            }
+            _ = try Vault.prune(vault: vault, now: now)
+            if Vault.thinningHistory(vault).log.passes.count != 1 { return "thin-log: a quiet pass was stored" }
+
+            try copyManifest(vault, from: snap.id, to: "20261002-120000-bbbbbbb5", created: "2026-10-02T12:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: secondID, created: "2026-10-02T18:00:00.000Z")
+            let more = chunkFile(vault, String(repeating: "ab", count: 32))
+            try FileManager.default.createDirectory(at: more.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("abcd".utf8).write(to: more)
+            _ = try Vault.prune(vault: vault, now: now.addingTimeInterval(60))
+            history = Vault.thinningHistory(vault)
+            if history.log.removed != 2 || history.log.freed != 10 || history.log.passes.count != 2 {
+                return "thin-log: two passes were \(history.log.removed) \(history.log.freed) \(history.log.passes.count)"
+            }
+            if history.log.passes[0].versions.map(\.id) != [secondID] || history.log.since != TimeText.nowISO(now) {
+                return "thin-log: the newer pass was \(history.log.passes[0].versions.map(\.id))"
+            }
+            let saved = try Data(contentsOf: vault.appendingPathComponent("thinning.json"))
+            try Data("{".utf8).write(to: vault.appendingPathComponent("thinning.json"))
+            if Vault.thinningHistory(vault).readable { return "thin-log: a broken file was treated as empty" }
+            try copyManifest(vault, from: snap.id, to: "20261003-120000-bbbbbbb6", created: "2026-10-03T12:00:00.000Z")
+            try copyManifest(vault, from: snap.id, to: thirdID, created: "2026-10-03T18:00:00.000Z")
+            _ = try Vault.prune(vault: vault, now: now)
+            let broken = try Data(contentsOf: vault.appendingPathComponent("thinning.json"))
+            if broken != Data("{".utf8) { return "thin-log: a broken file was replaced" }
+            if try Vault.listHeads(vault).contains(where: { $0.id == thirdID }) {
+                return "thin-log: a broken file kept the version"
+            }
+            try saved.write(to: vault.appendingPathComponent("thinning.json"))
+            history = Vault.thinningHistory(vault)
+            if history.log.removed != 2 || history.log.freed != 10 { return "thin-log: restoring the file changed the total" }
+            try Vault.relocate(from: vault, to: moved)
+            if FileManager.default.fileExists(atPath: vault.path) { return "thin-log: the old history stayed" }
+            let carried = Vault.thinningHistory(moved)
+            if !carried.readable || carried.log.removed != 2 || carried.log.freed != 10 || carried.log.passes.count != 2 {
+                return "thin-log: the move kept \(carried.log.removed) \(carried.log.freed)"
+            }
+            return nil
+        } catch {
+            return "thin-log: \(error.localizedDescription)"
+        }
+    }
+
+    private static func versionHead(_ created: String, _ id: String) -> SnapshotHead {
+        SnapshotHead(
+            format: AppInfo.format,
+            id: id,
+            parent: nil,
+            created: created,
+            label: "",
+            reason: "watch",
+            source: "/tmp",
+            stats: SnapshotStats()
+        )
     }
 
     private static func hashes(_ data: Data) -> [UInt64] {

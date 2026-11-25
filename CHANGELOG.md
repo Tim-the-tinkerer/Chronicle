@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.20
+
+- Each folder keeps a thinning history. It records when a pass removed versions, which versions, and how much space that freed, and it shows a total since logging began. Earlier runs are not included.
+
+## 1.0.19
+
+- When Chronicle removes older versions, it names them and says how much space that freed. If the kept versions still use those bytes, it says so.
+
+## 1.0.18
+
+- Earlier days in the version list are collapsed. The newest day stays open. Open an older day to see those versions or restore one.
+
 ## 1.0.17
 
 - Restoring over a file writes the copy beside it and replaces the original only after every chunk has been read. A damaged chunk leaves the file that was already there.

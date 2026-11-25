@@ -12,9 +12,16 @@ vault/
   trees/ab/<sha256>      one file per unique directory record
   snapshots/<id>.json    the version
   snapshots/<id>.head.json
+  thinning.json          optional log of passes that removed versions
 ```
 
 `<id>` is `yyyyMMdd-HHmmss` in UTC, a hyphen, and 8 lowercase hex digits. Example: `20261120-153012-a1b2c3d4`.
+
+## thinning.json
+
+Optional. Absent until thinning removes a version. Not required to restore.
+
+`since` is when logging began. `removed` and `freed` are the totals from that pass onward, including passes that are no longer listed. `passes` keeps the newest 40, newest first. Each pass has `at`, the versions it removed (`id` and `created`), `freed`, and `complete`. A pass with `complete` false adds nothing to `freed`. A file that will not parse is left unchanged. Moving the history copies this file.
 
 ## vault.json
 

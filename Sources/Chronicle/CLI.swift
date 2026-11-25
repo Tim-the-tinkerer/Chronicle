@@ -123,8 +123,16 @@ enum CLI {
                 print("deleted \(id)  freed \(ByteText.string(freed))")
             case "gc":
                 let vault = try URL(fileURLWithPath: argv.require("--vault"))
-                let freed = try Vault.clean(vault)
-                print("freed \(ByteText.string(freed))")
+                let cleaned = try Vault.clean(vault)
+                if cleaned.thinning.count > 0 {
+                    print(ThinText.sentence(
+                        names: ThinText.names(cleaned.thinning),
+                        freed: cleaned.freed,
+                        complete: cleaned.thinning.complete
+                    ))
+                } else {
+                    print("freed \(ByteText.string(cleaned.freed))")
+                }
             case "verify":
                 let vault = try URL(fileURLWithPath: argv.require("--vault"))
                 let report = try Vault.verifyHistory(vault: vault)

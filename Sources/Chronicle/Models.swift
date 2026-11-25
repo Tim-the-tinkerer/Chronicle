@@ -42,23 +42,239 @@ enum TimeText {
         return display(date)
     }
 
+    static func day(_ date: Date) -> String {
+        let day = DateFormatter()
+        day.locale = Locale.current
+        day.dateStyle = .medium
+        day.timeStyle = .none
+        return day.string(from: date)
+    }
+
     static func display(_ date: Date) -> String {
         let calendar = Calendar.current
-        let time = DateFormatter()
-        time.locale = Locale.current
-        time.dateStyle = .none
-        time.timeStyle = .short
+        let time = clock(date)
         if calendar.isDateInToday(date) {
-            return "Today \(time.string(from: date))"
+            return "Today \(time)"
         }
         if calendar.isDateInYesterday(date) {
-            return "Yesterday \(time.string(from: date))"
+            return "Yesterday \(time)"
         }
         let day = DateFormatter()
         day.locale = Locale.current
         day.dateStyle = .medium
         day.timeStyle = .short
         return day.string(from: date)
+    }
+
+    static func clock(_ date: Date) -> String {
+        let time = DateFormatter()
+        time.locale = Locale.current
+        time.dateStyle = .none
+        time.timeStyle = .short
+        return time.string(from: date)
+    }
+}
+
+/// The version list. The newest day stays open. Each earlier day starts collapsed.
+struct VersionDay: Identifiable, Equatable {
+    var id: String
+    var title: String
+    var opensFlat: Bool
+    var showsHeader: Bool
+    var heads: [SnapshotHead]
+}
+
+enum VersionDays {
+    static func group(_ heads: [SnapshotHead], now: Date = Date(), calendar: Calendar = .current) -> [VersionDay] {
+        var order: [String] = []
+        var buckets: [String: [SnapshotHead]] = [:]
+        var other: [SnapshotHead] = []
+        for head in heads {
+            guard let date = TimeText.parse(head.created) ?? Vault.Retention.date(from: head.id) else {
+                other.append(head)
+                continue
+            }
+            let parts = calendar.dateComponents([.year, .month, .day], from: date)
+            let key = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+            if buckets[key] == nil {
+                order.append(key)
+                buckets[key] = []
+            }
+            buckets[key]?.append(head)
+        }
+        order.sort(by: >)
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale.current
+        dayFormatter.calendar = calendar
+        dayFormatter.timeZone = calendar.timeZone
+        dayFormatter.dateStyle = .medium
+        dayFormatter.timeStyle = .none
+        var days: [VersionDay] = order.map { key in
+            let items = buckets[key] ?? []
+            let date = TimeText.parse(items[0].created) ?? Vault.Retention.date(from: items[0].id) ?? now
+            let title: String
+            if calendar.isDate(date, inSameDayAs: now) {
+                title = "Today"
+            } else if let previous = calendar.date(byAdding: .day, value: -1, to: now),
+                      calendar.isDate(date, inSameDayAs: previous) {
+                title = "Yesterday"
+            } else {
+                title = dayFormatter.string(from: date)
+            }
+            return VersionDay(id: key, title: title, opensFlat: false, showsHeader: false, heads: items)
+        }
+        if !other.isEmpty {
+            days.append(VersionDay(id: "other", title: "Other", opensFlat: false, showsHeader: false, heads: other))
+        }
+        let several = days.count > 1
+        return days.enumerated().map { index, day in
+            var copy = day
+            copy.opensFlat = index == 0
+            copy.showsHeader = several
+            return copy
+        }
+    }
+}
+
+struct PrunedVersion: Equatable {
+    var id: String
+    var created: Date?
+}
+
+/// What one thinning pass deleted. `freed` is chunk and directory bytes no remaining version uses.
+struct PruneResult: Equatable {
+    var removed: [PrunedVersion]
+    var freed: Int64
+    var complete: Bool
+    var count: Int { removed.count }
+    static let none = PruneResult(removed: [], freed: 0, complete: true)
+}
+
+struct CleanResult: Equatable {
+    var freed: Int64
+    var thinning: PruneResult
+}
+
+struct ThinningVersion: Codable, Equatable {
+    var id: String
+    var created: String?
+}
+
+/// One thinning pass that removed versions. `freed` is 0 when the pass could not read every version.
+struct ThinningPass: Codable, Equatable, Identifiable {
+    var at: String
+    var versions: [ThinningVersion]
+    var freed: Int64
+    var complete: Bool
+
+    var id: String {
+        "\(at)|\(versions.first?.id ?? "")|\(versions.count)"
+    }
+}
+
+/// Totals since the first logged pass. The list keeps the newest passes; the totals keep the rest.
+struct ThinningLog: Codable, Equatable {
+    var since: String
+    var removed: Int
+    var freed: Int64
+    var passes: [ThinningPass]
+
+    static let empty = ThinningLog(since: "", removed: 0, freed: 0, passes: [])
+    /// Newest passes kept in the list. Older passes stay in `removed` and `freed`.
+    static let keptPasses = 40
+
+    func recording(_ result: PruneResult, at date: Date) -> ThinningLog {
+        guard result.count > 0 else { return self }
+        let stamp = TimeText.nowISO(date)
+        let pass = ThinningPass(
+            at: stamp,
+            versions: result.removed.map { version in
+                ThinningVersion(id: version.id, created: version.created.map(TimeText.nowISO))
+            },
+            freed: result.complete ? result.freed : 0,
+            complete: result.complete
+        )
+        var next = self
+        if next.since.isEmpty { next.since = stamp }
+        next.removed += result.count
+        if result.complete { next.freed += result.freed }
+        next.passes.insert(pass, at: 0)
+        if next.passes.count > Self.keptPasses {
+            next.passes.removeLast(next.passes.count - Self.keptPasses)
+        }
+        return next
+    }
+}
+
+struct ThinningHistory: Equatable {
+    var log: ThinningLog
+    var readable: Bool
+    static let ready = ThinningHistory(log: .empty, readable: true)
+}
+
+enum ThinText {
+    static func names(_ result: PruneResult) -> [String] {
+        result.removed.map { version in
+            if let date = version.created { return TimeText.display(date) }
+            return "an older version"
+        }
+    }
+
+    static func sentence(names: [String], freed: Int64, complete: Bool) -> String {
+        let what: String
+        if names.count >= 5, let first = names.first, let last = names.last {
+            what = "Removed \(names.count) older versions, from \(first) through \(last)"
+        } else if names.isEmpty {
+            what = "Removed older versions"
+        } else {
+            what = "Removed \(list(names))"
+        }
+        if !complete {
+            return "\(what). A version could not be read, so unused chunks were left in place."
+        }
+        if freed > 0 {
+            return "\(what). Freed \(ByteText.string(freed))."
+        }
+        return "\(what). Freed nothing. The kept versions still use those bytes."
+    }
+
+    static func names(_ pass: ThinningPass) -> [String] {
+        pass.versions.map { version in
+            if let created = version.created, let date = TimeText.parse(created) {
+                return TimeText.display(date)
+            }
+            return "an older version"
+        }
+    }
+
+    static func report(_ items: [(name: String, result: PruneResult)], nameEach: Bool) -> String {
+        items.compactMap { item -> String? in
+            guard item.result.count > 0 else { return nil }
+            let line = sentence(names: names(item.result), freed: item.result.freed, complete: item.result.complete)
+            return nameEach ? "\(item.name): \(line)" : line
+        }.joined(separator: " ")
+    }
+
+    private static func list(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return items[0]
+        case 2: return "\(items[0]) and \(items[1])"
+        default:
+            let head = items.dropLast().joined(separator: ", ")
+            return "\(head), and \(items[items.count - 1])"
+        }
+    }
+}
+
+enum ThinningText {
+    static func total(_ log: ThinningLog) -> String {
+        let versions = log.removed == 1 ? "1 version" : "\(log.removed) versions"
+        let space = log.freed > 0 ? "Freed \(ByteText.string(log.freed))" : "Freed nothing"
+        guard let date = TimeText.parse(log.since) else {
+            return "\(versions) · \(space)"
+        }
+        return "\(TimeText.day(date)) · \(versions) · \(space)"
     }
 }
 
@@ -375,6 +591,8 @@ struct Snapshot: Codable, Equatable {
     var tree: String?
     /// Versions removed by retention after this one was saved. Not stored.
     var pruned: Int = 0
+    /// Which versions that pass removed, and how many bytes their chunks freed. Not stored.
+    var pruneDetail: PruneResult = .none
 
     enum CodingKeys: String, CodingKey {
         case format, id, parent, created, label, reason, source, files, skipped, stats, tree

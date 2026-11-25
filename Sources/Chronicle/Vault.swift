@@ -444,7 +444,9 @@ enum Vault {
         var updated = config
         updated.source = sourceURL.path
         try? JSONFile.write(updated, to: vault.appendingPathComponent("vault.json"), pretty: true)
-        snap.pruned = (try? pruneUnlocked(vault, now: Date())) ?? 0
+        let thinned = (try? pruneUnlocked(vault, now: Date())) ?? .none
+        snap.pruned = thinned.count
+        snap.pruneDetail = thinned
         return snap
     }
 
@@ -771,23 +773,23 @@ enum Vault {
     }
 
     @discardableResult
-    static func heal(_ vault: URL) throws -> Int {
-        guard FileManager.default.fileExists(atPath: vault.path) else { return 0 }
+    static func heal(_ vault: URL) throws -> PruneResult {
+        guard FileManager.default.fileExists(atPath: vault.path) else { return .none }
         let lock = try VaultLock(url: vault.appendingPathComponent("lock"))
         defer { lock.release() }
         return try healUnlocked(vault, pruneHistory: true)
     }
 
-    static func clean(_ vault: URL) throws -> Int64 {
+    static func clean(_ vault: URL) throws -> CleanResult {
         let lock = try VaultLock(url: vault.appendingPathComponent("lock"))
         defer { lock.release() }
-        _ = try? pruneUnlocked(vault, now: Date())
+        let thinned = (try? pruneUnlocked(vault, now: Date())) ?? .none
         let result = try collectGarbage(vault)
         guard result.complete else {
             throw ChronicleError.fail("A version could not be read, so unused chunks were left in place.")
         }
         try? FileManager.default.removeItem(at: vault.appendingPathComponent("pending"))
-        return result.freed
+        return CleanResult(freed: thinned.freed + result.freed, thinning: thinned)
     }
 
     /// Copies a history onto another folder or drive and checks that copy.
@@ -977,13 +979,13 @@ enum Vault {
         var complete: Bool
     }
 
-    private static func healUnlocked(_ vault: URL, pruneHistory: Bool = false) throws -> Int {
+    private static func healUnlocked(_ vault: URL, pruneHistory: Bool = false) throws -> PruneResult {
         let names: [String]
         do {
             names = try snapshotDirectoryNames(vault)
         } catch {
             // An unreadable version list is not an empty one. Leave every chunk.
-            return 0
+            return .none
         }
         let directory = vault.appendingPathComponent("snapshots")
         for name in names where name.hasSuffix(".partial") {
@@ -1002,9 +1004,9 @@ enum Vault {
             }
         }
         if pruneHistory {
-            return (try? pruneUnlocked(vault, now: Date())) ?? 0
+            return (try? pruneUnlocked(vault, now: Date())) ?? .none
         }
-        return 0
+        return .none
     }
 
     private static func collectGarbage(_ vault: URL) throws -> GarbageResult {
@@ -1243,6 +1245,7 @@ enum Vault {
             var label: String = ""
             var reason: String = ""
             var protect: Bool = false
+            var created: Date? = nil
 
             var pinned: Bool {
                 if protect || reason == "manual" { return true }
@@ -1321,13 +1324,13 @@ enum Vault {
     }
 
     /// Drops versions outside the retention ladder and then frees records no remaining version names.
-    static func prune(vault: URL, now: Date = Date()) throws -> Int {
+    static func prune(vault: URL, now: Date = Date()) throws -> PruneResult {
         let lock = try VaultLock(url: vault.appendingPathComponent("lock"))
         defer { lock.release() }
         return try pruneUnlocked(vault, now: now)
     }
 
-    private static func pruneUnlocked(_ vault: URL, now: Date) throws -> Int {
+    private static func pruneUnlocked(_ vault: URL, now: Date) throws -> PruneResult {
         let ids = try snapshotIDs(vault)
         var pins: [Retention.Pin] = []
         pins.reserveCapacity(ids.count)
@@ -1336,19 +1339,61 @@ enum Vault {
         }
         let kept = Retention.keep(pins, now: now)
         let directory = vault.appendingPathComponent("snapshots")
-        var removed = 0
-        for id in ids where !kept.contains(id) {
-            let body = directory.appendingPathComponent(id + ".json")
+        var removed: [PrunedVersion] = []
+        for pin in pins where !kept.contains(pin.id) {
+            let body = directory.appendingPathComponent(pin.id + ".json")
             if FileManager.default.fileExists(atPath: body.path) {
                 try FileManager.default.removeItem(at: body)
-                removed += 1
+                removed.append(PrunedVersion(id: pin.id, created: pin.created))
             }
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent(id + ".head.json"))
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(pin.id + ".head.json"))
         }
-        if removed > 0 {
-            _ = try? collectGarbage(vault)
+        removed.sort { lhs, rhs in
+            switch (lhs.created, rhs.created) {
+            case let (left?, right?):
+                if left == right { return lhs.id < rhs.id }
+                return left < right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                return lhs.id < rhs.id
+            }
         }
-        return removed
+        guard !removed.isEmpty else { return .none }
+        let result: PruneResult
+        if let garbage = try? collectGarbage(vault) {
+            result = PruneResult(removed: removed, freed: garbage.freed, complete: garbage.complete)
+        } else {
+            result = PruneResult(removed: removed, freed: 0, complete: false)
+        }
+        recordThinning(vault, result, at: now)
+        return result
+    }
+
+    /// The log for one watched folder. A missing file has not started. An unreadable file is left as it is.
+    static func thinningHistory(_ vault: URL) -> ThinningHistory {
+        let url = vault.appendingPathComponent("thinning.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return .ready }
+        guard let log = try? JSONFile.read(ThinningLog.self, from: url) else {
+            return ThinningHistory(log: .empty, readable: false)
+        }
+        return ThinningHistory(log: log, readable: true)
+    }
+
+    /// A log that will not parse is left in place, so a bad read does not start the total over.
+    private static func recordThinning(_ vault: URL, _ result: PruneResult, at now: Date) {
+        guard result.count > 0 else { return }
+        let url = vault.appendingPathComponent("thinning.json")
+        let current: ThinningLog
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard let loaded = try? JSONFile.read(ThinningLog.self, from: url) else { return }
+            current = loaded
+        } else {
+            current = .empty
+        }
+        try? JSONFile.write(current.recording(result, at: now), to: url, pretty: true)
     }
 
     /// Label and reason live in the head. The version body is not opened.
@@ -1356,9 +1401,10 @@ enum Vault {
     private static func pinFromHead(_ vault: URL, _ id: String) -> Retention.Pin {
         let url = vault.appendingPathComponent("snapshots").appendingPathComponent(id + ".head.json")
         guard let head = try? JSONFile.read(SnapshotHead.self, from: url), head.id == id else {
-            return Retention.Pin(id: id, protect: true)
+            return Retention.Pin(id: id, protect: true, created: Retention.date(from: id))
         }
-        return Retention.Pin(id: id, label: head.label, reason: head.reason)
+        let created = TimeText.parse(head.created) ?? Retention.date(from: id)
+        return Retention.Pin(id: id, label: head.label, reason: head.reason, created: created)
     }
 
     private static func readStored(_ vault: URL, _ id: String) throws -> StoredSnapshot {

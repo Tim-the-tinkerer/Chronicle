@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    /// Day ids the user has opened. The newest day is not in here; it stays open.
+    @State private var expandedDays: Set<String> = []
+    @State private var thinningOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -162,29 +165,42 @@ struct ContentView: View {
                     .disabled(model.busy || model.selectedLibrary == nil)
             }
             List(selection: $model.selectedSnapshotID) {
-                ForEach(model.summaries) { head in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(TimeText.display(head.created))
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Theme.text)
-                        Text(head.label.isEmpty ? Policy.reason(head.reason) : head.label)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.amber)
-                            .lineLimit(1)
-                        Text(versionDetail(head))
-                            .font(.system(size: 11))
-                            .foregroundStyle(head.stats.statusLine == nil ? Theme.muted : Theme.danger)
-                            .lineLimit(3)
+                ForEach(versionDays) { day in
+                    if day.opensFlat {
+                        if day.showsHeader {
+                            Section {
+                                versionRows(day)
+                            } header: {
+                                dayLabel(day)
+                            }
+                        } else {
+                            versionRows(day)
+                        }
+                    } else {
+                        DisclosureGroup(isExpanded: expanded(day.id)) {
+                            versionRows(day)
+                        } label: {
+                            dayLabel(day)
+                        }
                     }
-                    .padding(.vertical, 4)
-                    .tag(head.id)
                 }
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
-            .onChange(of: model.selectedSnapshotID) { id in
-                if let id { model.loadRows(id) }
+            .onChange(of: model.selection) { _ in
+                expandedDays = []
+                thinningOpen = false
             }
+            .onChange(of: model.selectedSnapshotID) { id in
+                if let id {
+                    if let day = versionDays.first(where: { !$0.opensFlat && $0.heads.contains { $0.id == id } }) {
+                        expandedDays.insert(day.id)
+                    }
+                    model.loadRows(id)
+                }
+            }
+            hairline
+            thinning
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Label", text: $model.labelText)
                     .textFieldStyle(.roundedBorder)
@@ -278,7 +294,7 @@ struct ContentView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             } else if !model.banner.isEmpty {
-                Text(model.banner).lineLimit(1).truncationMode(.middle)
+                Text(model.banner).lineLimit(3)
             } else {
                 Text(model.idleLine).lineLimit(1).truncationMode(.middle)
             }
@@ -289,6 +305,133 @@ struct ContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
         .background(Theme.panel)
+    }
+
+    private var thinning: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("THINNING")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(Theme.muted)
+            if !model.thinningReadable {
+                Text("The thinning log could not be read.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if model.thinningLog.removed == 0 {
+                Text("Nothing logged yet. Earlier thinning is not included.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Since logging began")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                Text(ThinningText.total(model.thinningLog))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let latest = model.thinningLog.passes.first {
+                    thinningPass(latest)
+                }
+                if model.thinningLog.passes.count > 1 {
+                    DisclosureGroup(isExpanded: $thinningOpen) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(Array(model.thinningLog.passes.dropFirst())) { pass in
+                                    thinningPass(pass)
+                                }
+                            }
+                        }
+                        .frame(height: min(120, CGFloat(model.thinningLog.passes.count - 1) * 44))
+                    } label: {
+                        Text("Earlier")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.muted)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+
+    private func thinningPass(_ pass: ThinningPass) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(TimeText.display(pass.at))
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Theme.text)
+            Text(ThinText.sentence(
+                names: ThinText.names(pass),
+                freed: pass.freed,
+                complete: pass.complete
+            ))
+            .font(.system(size: 10))
+            .foregroundStyle(Theme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var versionDays: [VersionDay] {
+        VersionDays.group(model.summaries)
+    }
+
+    private func expanded(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedDays.contains(id) },
+            set: { open in
+                if open {
+                    expandedDays.insert(id)
+                } else {
+                    expandedDays.remove(id)
+                }
+            }
+        )
+    }
+
+    private func dayLabel(_ day: VersionDay) -> some View {
+        HStack(spacing: 8) {
+            Text(day.title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.text)
+            Spacer(minLength: 4)
+            Text("\(day.heads.count)")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(Theme.muted)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func versionRows(_ day: VersionDay) -> some View {
+        ForEach(day.heads) { head in
+            versionRow(head, timeOnly: day.showsHeader)
+                .tag(head.id)
+        }
+    }
+
+    private func versionRow(_ head: SnapshotHead, timeOnly: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(versionWhen(head, timeOnly: timeOnly))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.text)
+            Text(head.label.isEmpty ? Policy.reason(head.reason) : head.label)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.amber)
+                .lineLimit(1)
+            Text(versionDetail(head))
+                .font(.system(size: 11))
+                .foregroundStyle(head.stats.statusLine == nil ? Theme.muted : Theme.danger)
+                .lineLimit(3)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func versionWhen(_ head: SnapshotHead, timeOnly: Bool) -> String {
+        if timeOnly, let date = TimeText.parse(head.created) {
+            return TimeText.clock(date)
+        }
+        return TimeText.display(head.created)
     }
 
     private var shownRows: [BrowserRow] {

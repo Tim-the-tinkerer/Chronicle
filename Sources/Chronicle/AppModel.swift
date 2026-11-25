@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published var latestDate: Date?
     @Published var skipLine = ""
     @Published var selectedIsDirty = false
+    @Published var thinningLog = ThinningLog.empty
+    @Published var thinningReadable = true
 
     private let work = DispatchQueue(label: "com.tim.chronicle.work", qos: .userInitiated)
     private let watch = FolderWatch()
@@ -117,18 +119,21 @@ final class AppModel: ObservableObject {
         refresh()
         // heal reads the vault. On a sleeping external drive that has to stay off the main thread.
         // It also thins old versions, so the list is loaded again after that finishes.
-        let vaults = libraries.map(\.vault)
+        let vaults = libraries.map { (name: $0.name, vault: $0.vault) }
+        let nameEach = vaults.count > 1
         work.async {
-            var removed = 0
-            for path in vaults {
-                let vault = URL(fileURLWithPath: path)
+            var thinned: [(name: String, result: PruneResult)] = []
+            for item in vaults {
+                let vault = URL(fileURLWithPath: item.vault)
                 guard FileManager.default.fileExists(atPath: vault.path) else { continue }
-                removed += (try? Vault.heal(vault)) ?? 0
+                let result = (try? Vault.heal(vault)) ?? .none
+                if result.count > 0 {
+                    thinned.append((item.name, result))
+                }
             }
             DispatchQueue.main.async {
-                if removed > 0 {
-                    let count = removed == 1 ? "1 older version" : "\(removed) older versions"
-                    self.thinNote = "Removed \(count)."
+                if !thinned.isEmpty {
+                    self.thinNote = ThinText.report(thinned, nameEach: nameEach)
                     self.banner = self.thinNote
                 }
                 self.refresh()
@@ -448,6 +453,8 @@ final class AppModel: ObservableObject {
             totals = nil
             latestDate = nil
             skipLine = ""
+            thinningLog = .empty
+            thinningReadable = true
             return
         }
         // The previous folder's versions stay in `summaries` until this returns.
@@ -461,6 +468,8 @@ final class AppModel: ObservableObject {
             selectedPath = nil
             totals = nil
             latestDate = nil
+            thinningLog = .empty
+            thinningReadable = true
         }
         if working {
             refreshPending = true
@@ -477,6 +486,8 @@ final class AppModel: ObservableObject {
             totals = nil
             latestDate = nil
             skipLine = VaultConfig.defaultSkip.joined(separator: ", ")
+            thinningLog = .empty
+            thinningReadable = true
             return
         }
         listEpoch += 1
@@ -487,6 +498,7 @@ final class AppModel: ObservableObject {
             let shown = Vault.rowGlances(vault: vault, heads: heads)
             let totals = try? Vault.totals(vault)
             let skip = (try? Vault.config(vault).skipNames.joined(separator: ", ")) ?? VaultConfig.defaultSkip.joined(separator: ", ")
+            let history = Vault.thinningHistory(vault)
             DispatchQueue.main.async {
                 guard epoch == self.listEpoch, !self.working, self.selection == libraryID else { return }
                 self.shownLibrary = libraryID
@@ -495,6 +507,8 @@ final class AppModel: ObservableObject {
                 self.totals = totals
                 self.latestDate = heads.first.flatMap { TimeText.parse($0.created) }
                 self.skipLine = skip
+                self.thinningLog = history.log
+                self.thinningReadable = history.readable
                 if let current = self.selectedSnapshotID, heads.contains(where: { $0.id == current }) {
                     self.loadRows(current)
                 } else if let first = heads.first {
@@ -663,10 +677,18 @@ final class AppModel: ObservableObject {
         begin("Cleaning unused chunks…")
         work.async {
             do {
-                let freed = try Vault.clean(vault)
+                let cleaned = try Vault.clean(vault)
                 DispatchQueue.main.async {
                     self.finishWork()
-                    self.banner = "Freed \(ByteText.string(freed))."
+                    if cleaned.thinning.count > 0 {
+                        self.banner = ThinText.sentence(
+                            names: ThinText.names(cleaned.thinning),
+                            freed: cleaned.freed,
+                            complete: cleaned.thinning.complete
+                        )
+                    } else {
+                        self.banner = "Freed \(ByteText.string(cleaned.freed))."
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -861,8 +883,11 @@ final class AppModel: ObservableObject {
             line = "\(status). \(body)"
         }
         if snap.pruned > 0 {
-            let count = snap.pruned == 1 ? "1 older version" : "\(snap.pruned) older versions"
-            line += " Removed \(count)."
+            line += " " + ThinText.sentence(
+                names: ThinText.names(snap.pruneDetail),
+                freed: snap.pruneDetail.freed,
+                complete: snap.pruneDetail.complete
+            )
         }
         return line
     }

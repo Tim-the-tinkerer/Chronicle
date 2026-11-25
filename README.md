@@ -4,7 +4,7 @@ A personal time machine for one folder at a time. Chronicle watches the folder a
 
 The cost of a full copy, times the number of versions, is what history usually costs. Chronicle keeps the new bytes.
 
-**Version:** 1.0.17 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
+**Version:** 1.0.20 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
 
 ## What you see
 
@@ -20,7 +20,7 @@ Snapshot (⌘S) writes a version now. A second request while one is running wait
 
 The schedule is every 15 minutes by default. It can be hourly, daily, or manual. One folder that is missing, or whose drive is unplugged, does not keep the others from saving. An automatic check that finds nothing waits out that folder's interval. An automatic version is written when a file, a symlink, or a directory was added, removed, or changed. A directory whose only change is its modification time does not count. Opening the folder in Finder moves that time when it writes a skipped name such as `.DS_Store`. The same unreadable folder, or the same unreadable file, does not start another automatic version. The first time a path cannot be read, Chronicle saves one. A version saved for another reason still says how many files were carried forward. A manual snapshot still saves.
 
-Every version from the last 24 hours is kept. After that Chronicle keeps the oldest version in each hour for 30 days, then the oldest version of each day. The newest version stays. Opening Chronicle applies that to the history already on disk. The version list updates after a snapshot, a delete, a cleanup, and that thinning. A refresh that started earlier does not replace the list. Switching folders clears that list immediately, so a version from one folder cannot be deleted or restored as if it belonged to another. A label typed for one folder is not applied when the menu snapshots a different folder.
+Every version from the last 24 hours is kept. After that Chronicle keeps the oldest version in each hour for 30 days, then the oldest version of each day. The newest version stays. Opening Chronicle applies that to the history already on disk. When Chronicle removes older versions, it names them and says how much space that freed. If the kept versions still use those bytes, it says so. Each folder keeps a thinning history under its version list. That history records when a pass removed versions, which versions, and how much space it freed, and it shows a total since logging began. Earlier runs are not included. The version list updates after a snapshot, a delete, a cleanup, and that thinning. The newest day stays open. Each earlier day is collapsed until you open it to look at those versions or restore one. A refresh that started earlier does not replace the list. Switching folders clears that list immediately, so a version from one folder cannot be deleted or restored as if it belonged to another. A label typed for one folder is not applied when the menu snapshots a different folder.
 
 Opening Chronicle checks each automatically watched folder against its latest version and saves a version when something changed while the app was closed, including an empty folder added or removed. A folder it still cannot read is not, by itself, a change. That check uses each file's size and modification time. Re-read Every File reads every byte. A manual folder is left until you snapshot it. Opening a history, and the check the schedule does every 20 seconds, read the drive without blocking the window.
 

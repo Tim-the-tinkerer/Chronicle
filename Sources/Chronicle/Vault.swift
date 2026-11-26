@@ -693,6 +693,47 @@ enum Vault {
         if entry.mtimeNS != 0 { applyMtime(destination.path, entry.mtimeNS) }
     }
 
+    /// Writes one recorded folder and everything stored inside it. `dest` is that folder.
+    /// Files already in `dest` stay until their own copy is complete. Other files there are left in place.
+    static func restoreDirectory(vault: URL, snapshot id: String, path: String, dest: URL, allowInsideSource: Bool) throws {
+        guard RelPath.isSafe(path) else {
+            throw ChronicleError.fail("Refusing a path that leaves the folder.")
+        }
+        let snap = try load(vault, id)
+        if let entry = snap.files.first(where: { $0.path == path }), entry.kind != "dir" {
+            throw ChronicleError.fail("Choose a folder to restore.")
+        }
+        let inside = snap.files.filter { $0.path == path || $0.path.hasPrefix(path + "/") }
+        guard inside.contains(where: { $0.path == path && $0.kind == "dir" }) else {
+            throw ChronicleError.fail("That folder is not in this version.")
+        }
+        let destination = dest.standardizedFileURL
+        try guardDestination(destination, source: snap.source, vault: vault, allowInsideSource: allowInsideSource)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let store = ChunkStore(root: vault)
+        for entry in inside where entry.path != path && (entry.kind == "file" || entry.kind == "link") {
+            let relative = String(entry.path.dropFirst(path.count + 1))
+            let url = try destinationURL(destination, relative)
+            try prepareDirectory(url.deletingLastPathComponent(), root: destination)
+            if entry.kind == "link" {
+                try writeLink(url, target: entry.target ?? "", name: entry.path)
+            } else {
+                try writeFile(url, entry: entry, store: store)
+            }
+            if entry.mtimeNS != 0 { applyMtime(url.path, entry.mtimeNS) }
+        }
+        let directories = inside.filter { $0.kind == "dir" }.sorted { $0.path.count > $1.path.count }
+        for entry in directories {
+            let relative = entry.path == path ? "" : String(entry.path.dropFirst(path.count + 1))
+            let url = relative.isEmpty ? destination : try destinationURL(destination, relative)
+            if !relative.isEmpty {
+                try prepareDirectory(url, root: destination)
+            }
+            if entry.mode != 0 { chmod(url.path, mode_t(entry.mode)) }
+            if entry.mtimeNS != 0 { applyMtime(url.path, entry.mtimeNS) }
+        }
+    }
+
     static func delete(vault: URL, id: String) throws -> Int64 {
         guard SnapshotID.valid(id) else { throw ChronicleError.fail("Unknown version.") }
         let lock = try VaultLock(url: vault.appendingPathComponent("lock"))

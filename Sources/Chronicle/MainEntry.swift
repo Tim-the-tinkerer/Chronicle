@@ -189,6 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func reread(_ sender: Any?) { model.takeSnapshot(reason: "manual", verify: true) }
     @objc private func restore(_ sender: Any?) { model.restoreSelected() }
     @objc private func restoreFile(_ sender: Any?) { model.restoreSelectedFile() }
+    @objc private func restoreDirectory(_ sender: Any?) { model.restoreSelectedDirectory() }
     @objc private func deleteVersion(_ sender: Any?) { model.deleteSelectedSnapshot() }
     @objc private func clean(_ sender: Any?) { model.cleanSelected() }
     @objc private func verifyHistory(_ sender: Any?) { model.verifySelected() }
@@ -250,6 +251,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         restoreItem.target = self
         let fileRestore = fileMenu.addItem(withTitle: "Restore File…", action: #selector(restoreFile(_:)), keyEquivalent: "e")
         fileRestore.target = self
+        let folderRestore = fileMenu.addItem(withTitle: "Restore Folder…", action: #selector(restoreDirectory(_:)), keyEquivalent: "e")
+        folderRestore.keyEquivalentModifierMask = [.command, .shift]
+        folderRestore.target = self
         let deleteItem = fileMenu.addItem(withTitle: "Delete Version…", action: #selector(deleteVersion(_:)), keyEquivalent: "\u{8}")
         deleteItem.target = self
         fileMenu.addItem(.separator())

@@ -9,6 +9,8 @@ final class AppModel: ObservableObject {
     @Published var glances: [String: VersionGlance] = [:]
     @Published var selectedSnapshotID: String?
     @Published var rows: [BrowserRow] = []
+    /// Folders recorded in the selected version, including ones the file list hides.
+    @Published var folderPaths: [String] = []
     @Published var filter = ""
     @Published var selectedPath: String?
     @Published var labelText = ""
@@ -46,6 +48,9 @@ final class AppModel: ObservableObject {
     private var refreshPending = false
     /// The folder whose versions are on screen. A switch clears that list immediately.
     private var shownLibrary: String?
+    /// True once the selected version's folder list has been read, even when it is empty.
+    private var foldersReady = false
+    private var folderSnapshotID: String?
 
     var selectedLibrary: Library? {
         libraries.first { $0.id == selection }
@@ -399,6 +404,7 @@ final class AppModel: ObservableObject {
                             self.loadRows(first.id)
                         } else {
                             self.rows = []
+                            self.dropFolderList()
                             self.selectedSnapshotID = nil
                         }
                     }
@@ -448,6 +454,7 @@ final class AppModel: ObservableObject {
             summaries = []
             glances = [:]
             rows = []
+            dropFolderList()
             selectedSnapshotID = nil
             selectedPath = nil
             totals = nil
@@ -464,6 +471,7 @@ final class AppModel: ObservableObject {
             summaries = []
             glances = [:]
             rows = []
+            dropFolderList()
             selectedSnapshotID = nil
             selectedPath = nil
             totals = nil
@@ -481,6 +489,7 @@ final class AppModel: ObservableObject {
             summaries = []
             glances = [:]
             rows = []
+            dropFolderList()
             selectedSnapshotID = nil
             selectedPath = nil
             totals = nil
@@ -515,6 +524,7 @@ final class AppModel: ObservableObject {
                     self.loadRows(first.id)
                 } else {
                     self.rows = []
+                    self.dropFolderList()
                     self.selectedSnapshotID = nil
                 }
             }
@@ -524,6 +534,7 @@ final class AppModel: ObservableObject {
     func loadRows(_ id: String) {
         guard let library = selectedLibrary else { return }
         selectedSnapshotID = id
+        dropFolderList()
         let libraryID = library.id
         let vault = URL(fileURLWithPath: library.vault)
         work.async {
@@ -534,6 +545,9 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
                     self.rows = []
+                    self.folderPaths = []
+                    self.folderSnapshotID = id
+                    self.foldersReady = true
                     if !self.busy { self.banner = error.localizedDescription }
                 }
                 return
@@ -548,9 +562,13 @@ final class AppModel: ObservableObject {
                 carried: warnings.carried,
                 unread: warnings.unread
             )
+            let folders = snap.files.compactMap { $0.kind == "dir" ? $0.path : nil }.sorted()
             DispatchQueue.main.async {
                 guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
                 self.rows = rows
+                self.folderPaths = folders
+                self.folderSnapshotID = id
+                self.foldersReady = true
                 if let path = self.selectedPath, !rows.contains(where: { $0.path == path }) {
                     self.selectedPath = nil
                 }
@@ -637,6 +655,74 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func restoreSelectedDirectory() {
+        guard !working else {
+            banner = "Chronicle is still finishing the last job."
+            return
+        }
+        guard let library = selectedLibrary, let id = selectedSnapshotID else {
+            banner = "Choose a folder in this version."
+            return
+        }
+        guard foldersReady, folderSnapshotID == id else {
+            banner = "The folder list is still loading."
+            return
+        }
+        guard !folderPaths.isEmpty else {
+            banner = "This version has no folders. Restore Version writes the whole folder."
+            return
+        }
+        let vault = URL(fileURLWithPath: library.vault)
+        let snapshot = id
+        let paths = folderPaths
+        let preferred = RestoreTarget.preferred(row: selectedRow, folders: paths)
+        guard let path = FolderPickPanel(paths: paths, preferred: preferred).run() else { return }
+        guard !working else {
+            banner = "Chronicle is still finishing the last job."
+            return
+        }
+        guard paths.contains(path), RelPath.isSafe(path) else {
+            banner = "That folder is not in this version."
+            return
+        }
+        let name = (path as NSString).lastPathComponent
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Restore Here"
+        panel.message = "Chronicle creates a new folder named \"\(name)\" here and puts the saved files inside it. The watched folder is left alone."
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard !working else {
+            banner = "Chronicle is still finishing the last job."
+            return
+        }
+        let dest = uniqueDestination(url, name: name)
+        begin("Restoring \(name)…")
+        work.async {
+            do {
+                try Vault.restoreDirectory(vault: vault, snapshot: snapshot, path: path, dest: dest, allowInsideSource: false)
+                DispatchQueue.main.async {
+                    self.finishWork()
+                    self.banner = "Restored to \(dest.path)"
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.finishWork()
+                    self.banner = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func dropFolderList() {
+        folderPaths = []
+        foldersReady = false
+        folderSnapshotID = nil
     }
 
     func deleteSelectedSnapshot() {

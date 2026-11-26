@@ -332,6 +332,35 @@ enum SnapshotID {
     }
 }
 
+enum RestoreTarget {
+    /// The folder a row names. A file names the folder that contains it.
+    /// A file at the top of the version has no folder here. A removed folder stays gone.
+    static func folder(for row: BrowserRow) -> String? {
+        if row.kind == "dir" {
+            return row.change == "removed" ? nil : row.path
+        }
+        guard let slash = row.path.lastIndex(of: "/") else { return nil }
+        return String(row.path[..<slash])
+    }
+
+    /// The folder to highlight. A listed folder wins. A file highlights the deepest
+    /// recorded folder that contains it. A removed folder is not offered.
+    static func preferred(row: BrowserRow?, folders: [String]) -> String? {
+        guard let row else { return nil }
+        let known = Set(folders)
+        if row.kind == "dir" {
+            guard row.change != "removed", known.contains(row.path) else { return nil }
+            return row.path
+        }
+        var path = row.path
+        while let slash = path.lastIndex(of: "/") {
+            path = String(path[..<slash])
+            if known.contains(path) { return path }
+        }
+        return nil
+    }
+}
+
 enum RelPath {
     static func isExcluded(_ path: String, names: Set<String>) -> Bool {
         path.split(separator: "/").contains { names.contains(String($0)) }

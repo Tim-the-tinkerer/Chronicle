@@ -17,6 +17,7 @@ enum SelfTest {
             testGarbageCollectsOrphans,
             testDamagedChunk,
             testOverwriteWaitsUntilTheRestoreSucceeds,
+            testRestoreDirectoryWritesTheFolder,
             testRefusesWatchedFolder,
             testRejectsPathEscape,
             testClosedEditIsVisible,
@@ -510,6 +511,150 @@ enum SelfTest {
             return nil
         } catch {
             return "overwrite: \(error.localizedDescription)"
+        }
+    }
+
+    /// One folder from a version comes back with the files inside it, and nothing beside it.
+    private static func testRestoreDirectoryWritesTheFolder() -> String? {
+        let file = BrowserRow(path: "notes/page.txt", kind: "file", change: "same", size: 4, newBytes: 0, chunkCount: 1)
+        if RestoreTarget.folder(for: file) != "notes" { return "folder: a nested file restored \(RestoreTarget.folder(for: file) ?? "nothing")" }
+        let top = BrowserRow(path: "top.txt", kind: "file", change: "same", size: 3, newBytes: 0, chunkCount: 1)
+        if RestoreTarget.folder(for: top) != nil { return "folder: a top file named a folder" }
+        let directory = BrowserRow(path: "notes/img", kind: "dir", change: "added", size: 0, newBytes: 0, chunkCount: 0)
+        if RestoreTarget.folder(for: directory) != "notes/img" { return "folder: the selected folder was \(RestoreTarget.folder(for: directory) ?? "missing")" }
+        let gone = BrowserRow(path: "blank", kind: "dir", change: "removed", size: 0, newBytes: 0, chunkCount: 0)
+        if RestoreTarget.folder(for: gone) != nil { return "folder: a removed folder was offered" }
+        let folders = ["notes", "notes/img", "keep"]
+        let deep = BrowserRow(path: "notes/img/a.txt", kind: "file", change: "same", size: 3, newBytes: 0, chunkCount: 1)
+        if RestoreTarget.preferred(row: deep, folders: folders) != "notes/img" {
+            return "folder: a nested file offered \(RestoreTarget.preferred(row: deep, folders: folders) ?? "nothing")"
+        }
+        let missingParent = BrowserRow(path: "notes/missing/a.txt", kind: "file", change: "same", size: 1, newBytes: 0, chunkCount: 1)
+        if RestoreTarget.preferred(row: missingParent, folders: folders) != "notes" {
+            return "folder: a missing parent offered \(RestoreTarget.preferred(row: missingParent, folders: folders) ?? "nothing")"
+        }
+        if RestoreTarget.preferred(row: top, folders: folders) != nil { return "folder: a top file offered a folder" }
+        if RestoreTarget.preferred(row: directory, folders: folders) != "notes/img" {
+            return "folder: the chosen folder was \(RestoreTarget.preferred(row: directory, folders: folders) ?? "missing")"
+        }
+        if RestoreTarget.preferred(row: gone, folders: ["blank"]) != nil { return "folder: a removed folder was still offered" }
+        if RestoreTarget.preferred(row: nil, folders: folders) != nil { return "folder: no selection offered a folder" }
+        let listed = ["Games", "Games/cyber_llamas", "Audio scripts"]
+        if FolderPickPanel.matching(listed, query: "CYBER") != ["Games/cyber_llamas"] {
+            return "folder: the list filter missed a folder"
+        }
+        if FolderPickPanel.matching(listed, query: "audio") != ["Audio scripts"] {
+            return "folder: the list filter missed a spaced name"
+        }
+        if FolderPickPanel.matching(listed, query: "   ").count != listed.count {
+            return "folder: a blank filter hid folders"
+        }
+
+        let root = temp("folder-restore")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        let dest = root.appendingPathComponent("notes")
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("notes/img"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("notes/blank"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("keep"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("notes-extra"), withIntermediateDirectories: true)
+            try Data("page".utf8).write(to: source.appendingPathComponent("notes/page.txt"))
+            try Data("img".utf8).write(to: source.appendingPathComponent("notes/img/a.txt"))
+            try Data("aaa".utf8).write(to: source.appendingPathComponent("keep/a.txt"))
+            try Data("top".utf8).write(to: source.appendingPathComponent("top.txt"))
+            try Data("nope".utf8).write(to: source.appendingPathComponent("notes-extra/x.txt"))
+            try FileManager.default.createSymbolicLink(
+                atPath: source.appendingPathComponent("notes/alias").path,
+                withDestinationPath: "page.txt"
+            )
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "folder: no version"
+            }
+            try Vault.restoreDirectory(vault: vault, snapshot: snap.id, path: "notes", dest: dest, allowInsideSource: false)
+            if try Data(contentsOf: dest.appendingPathComponent("page.txt")) != Data("page".utf8) {
+                return "folder: the page was not restored"
+            }
+            if try Data(contentsOf: dest.appendingPathComponent("img/a.txt")) != Data("img".utf8) {
+                return "folder: a nested file was not restored"
+            }
+            if lstatInfoKind(dest.appendingPathComponent("blank")) != "dir" {
+                return "folder: an empty directory was dropped"
+            }
+            if try FileManager.default.destinationOfSymbolicLink(atPath: dest.appendingPathComponent("alias").path) != "page.txt" {
+                return "folder: the link was not restored"
+            }
+            if FileManager.default.fileExists(atPath: dest.appendingPathComponent("keep/a.txt").path)
+                || FileManager.default.fileExists(atPath: dest.appendingPathComponent("top.txt").path)
+                || FileManager.default.fileExists(atPath: dest.appendingPathComponent("x.txt").path) {
+                return "folder: a file outside the folder was written"
+            }
+            do {
+                try Vault.restoreFile(vault: vault, snapshot: snap.id, path: "notes", dest: root.appendingPathComponent("file"), allowInsideSource: false)
+                return "folder: a folder restored as a file"
+            } catch {
+                if error.localizedDescription != "Choose a file to restore." {
+                    return "folder: file restore said \(error.localizedDescription)"
+                }
+            }
+            do {
+                try Vault.restoreDirectory(vault: vault, snapshot: snap.id, path: "top.txt", dest: root.appendingPathComponent("top"), allowInsideSource: false)
+                return "folder: a file restored as a folder"
+            } catch {
+                if error.localizedDescription != "Choose a folder to restore." {
+                    return "folder: \(error.localizedDescription)"
+                }
+            }
+            do {
+                try Vault.restoreDirectory(vault: vault, snapshot: snap.id, path: "missing", dest: root.appendingPathComponent("missing"), allowInsideSource: false)
+                return "folder: a missing folder was created"
+            } catch {
+                if error.localizedDescription != "That folder is not in this version." {
+                    return "folder: missing said \(error.localizedDescription)"
+                }
+            }
+            do {
+                try Vault.restoreDirectory(
+                    vault: vault,
+                    snapshot: snap.id,
+                    path: "notes",
+                    dest: source.appendingPathComponent("notes-copy"),
+                    allowInsideSource: false
+                )
+                return "folder: wrote into the watched folder"
+            } catch {
+                if error.localizedDescription != "Chronicle will not write into the watched folder. Choose another place." {
+                    return "folder: watched said \(error.localizedDescription)"
+                }
+            }
+            let again = root.appendingPathComponent("again")
+            try FileManager.default.createDirectory(at: again, withIntermediateDirectories: true)
+            try Data("keep-me".utf8).write(to: again.appendingPathComponent("page.txt"))
+            guard let hash = snap.files.first(where: { $0.path == "notes/page.txt" })?.chunks.first else {
+                return "folder: no page chunk"
+            }
+            let chunk = chunkFile(vault, hash)
+            var raw = try Data(contentsOf: chunk)
+            raw[raw.count - 1] ^= 0xFF
+            try raw.write(to: chunk)
+            do {
+                try Vault.restoreDirectory(vault: vault, snapshot: snap.id, path: "notes", dest: again, allowInsideSource: false)
+                return "folder: a damaged file replaced the original"
+            } catch {
+                if !error.localizedDescription.hasPrefix("Damaged chunk") {
+                    return "folder: damage said \(error.localizedDescription)"
+                }
+            }
+            if try Data(contentsOf: again.appendingPathComponent("page.txt")) != Data("keep-me".utf8) {
+                return "folder: the damaged file removed the original"
+            }
+            if try Data(contentsOf: again.appendingPathComponent("img/a.txt")) != Data("img".utf8) {
+                return "folder: a file before the damaged one was lost"
+            }
+            return nil
+        } catch {
+            return "folder: \(error.localizedDescription)"
         }
     }
 

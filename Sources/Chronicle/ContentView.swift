@@ -249,19 +249,7 @@ struct ContentView: View {
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
             detail
-            HStack(spacing: 8) {
-                Button("Restore Version…") { model.restoreSelected() }
-                    .buttonStyle(ChronicleButtonStyle(kind: .primary))
-                    .disabled(model.busy || model.selectedSnapshotID == nil)
-                Button("Restore File…") { model.restoreSelectedFile() }
-                    .buttonStyle(ChronicleButtonStyle())
-                    .disabled(model.busy || model.selectedRow == nil || model.selectedRow?.kind == "dir" || model.selectedRow?.change == "removed" || model.selectedRow?.change == "unread")
-                Spacer()
-                Button("Delete Version") { model.deleteSelectedSnapshot() }
-                    .buttonStyle(ChronicleButtonStyle(kind: .danger))
-                    .disabled(model.busy || model.selectedSnapshotID == nil)
-            }
-            .padding(12)
+            restoreBar
         }
         .background(Theme.bg)
     }
@@ -432,6 +420,55 @@ struct ContentView: View {
             return TimeText.clock(date)
         }
         return TimeText.display(head.created)
+    }
+
+    private var canRestoreFolder: Bool {
+        !model.busy && model.selectedLibrary != nil && model.selectedSnapshotID != nil
+    }
+
+    private var restoreBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                restoreVersionButton
+                restoreFileButton
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 8) {
+                restoreFolderButton
+                Spacer(minLength: 8)
+                deleteVersionButton
+            }
+        }
+        .padding(12)
+    }
+
+    private var restoreVersionButton: some View {
+        Button("Restore Version…") { model.restoreSelected() }
+            .buttonStyle(ChronicleButtonStyle(kind: .primary))
+            .disabled(model.busy || model.selectedSnapshotID == nil)
+            .fixedSize()
+    }
+
+    private var restoreFileButton: some View {
+        Button("Restore File…") { model.restoreSelectedFile() }
+            .buttonStyle(ChronicleButtonStyle())
+            .disabled(model.busy || model.selectedRow == nil || model.selectedRow?.kind == "dir" || model.selectedRow?.change == "removed" || model.selectedRow?.change == "unread")
+            .fixedSize()
+    }
+
+    private var restoreFolderButton: some View {
+        Button("Restore Folder…") { model.restoreSelectedDirectory() }
+            .buttonStyle(ChronicleButtonStyle())
+            .disabled(!canRestoreFolder)
+            .fixedSize()
+            .help("Pick a folder from this version. Folders that did not change are included.")
+    }
+
+    private var deleteVersionButton: some View {
+        Button("Delete Version") { model.deleteSelectedSnapshot() }
+            .buttonStyle(ChronicleButtonStyle(kind: .danger))
+            .disabled(model.busy || model.selectedSnapshotID == nil)
+            .fixedSize()
     }
 
     private var shownRows: [BrowserRow] {

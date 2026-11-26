@@ -18,6 +18,7 @@ enum CLI {
       Chronicle stats --vault PATH
       Chronicle restore --vault PATH --snapshot ID --dest PATH [--into-source]
       Chronicle restore-file --vault PATH --snapshot ID --path REL --dest FILE [--into-source]
+      Chronicle restore-dir --vault PATH --snapshot ID --path REL --dest FOLDER [--into-source]
       Chronicle delete --vault PATH --snapshot ID
       Chronicle gc --vault PATH
       Chronicle verify --vault PATH
@@ -109,6 +110,19 @@ enum CLI {
                 let path = try argv.require("--path")
                 let dest = try URL(fileURLWithPath: argv.require("--dest"))
                 try Vault.restoreFile(
+                    vault: vault,
+                    snapshot: id,
+                    path: path,
+                    dest: dest,
+                    allowInsideSource: argv.flags.contains("--into-source")
+                )
+                print("restored \(path) → \(dest.path)")
+            case "restore-dir":
+                let vault = try URL(fileURLWithPath: argv.require("--vault"))
+                let id = try argv.require("--snapshot")
+                let path = try argv.require("--path")
+                let dest = try URL(fileURLWithPath: argv.require("--dest"))
+                try Vault.restoreDirectory(
                     vault: vault,
                     snapshot: id,
                     path: path,

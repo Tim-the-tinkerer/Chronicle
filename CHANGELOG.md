@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.24
+
+- Restore Folder opens a folder list, and only after that list closes does it ask where to write the folder. Choosing a place starts the restore. The button stays on its own row.
+
+## 1.0.23
+
+- Restore Folder asks where to write the folder only after the folder list has closed. Choosing a place now starts the restore, and the status line names the folder that was written.
+
+## 1.0.22
+
+- Restore Folder lists every folder in that version, including folders the file list hides because they did not change. Pick the folder, then where to write it.
+
+## 1.0.21
+
+- Restore Folder writes one folder from a version, and the files stored inside it, into a new folder. A file in the list restores the folder that contains it.
+
 ## 1.0.20
 
 - Each folder keeps a thinning history. It records when a pass removed versions, which versions, and how much space that freed, and it shows a total since logging began. Earlier runs are not included.

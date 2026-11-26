@@ -228,6 +228,8 @@ final class AppModel: ObservableObject {
         let name = url.lastPathComponent
         let sourceURL = URL(fileURLWithPath: path, isDirectory: true)
         let vault: URL
+        var clearRemembered = false
+        var rememberedRoot: URL?
         switch answer {
         case .onThisMac:
             do {
@@ -246,7 +248,7 @@ final class AppModel: ObservableObject {
                 banner = error.localizedDescription
                 return
             }
-            UserDefaults.standard.removeObject(forKey: snapshotRootKey)
+            clearRemembered = true
         case .remembered(let root):
             let child = SnapshotPlace.child(in: root, name: name)
             if let problem = placementProblem(child, source: sourceURL, current: nil) {
@@ -273,12 +275,24 @@ final class AppModel: ObservableObject {
                 banner = error.localizedDescription
                 return
             }
-            let root = SnapshotPlace.rememberedRoot(
+            rememberedRoot = SnapshotPlace.rememberedRoot(
                 chosen: picked,
                 isVolume: flags.isVolume,
                 isEmpty: flags.isEmpty
             )
-            UserDefaults.standard.set(root.path, forKey: snapshotRootKey)
+        }
+        // The place panel has returned. This list opens on its own, then the snapshot starts.
+        guard let skipNames = FolderSetupPanel(folderName: name, source: sourceURL).run() else { return }
+        do {
+            try Vault.prepare(vault: vault, source: sourceURL, name: name, skipNames: skipNames)
+        } catch {
+            banner = error.localizedDescription
+            return
+        }
+        if clearRemembered {
+            UserDefaults.standard.removeObject(forKey: snapshotRootKey)
+        } else if let rememberedRoot {
+            UserDefaults.standard.set(rememberedRoot.path, forKey: snapshotRootKey)
         }
         let library = Library(
             id: id,
@@ -292,6 +306,7 @@ final class AppModel: ObservableObject {
         saveLibraries()
         selection = id
         UserDefaults.standard.set(id, forKey: defaultsKey)
+        skipLine = skipNames.joined(separator: ", ")
         rewatch()
         takeSnapshot(libraryID: id, reason: "first", verify: false)
     }
@@ -632,7 +647,9 @@ final class AppModel: ObservableObject {
                 self.folderPaths = listed.folders
                 self.folderSnapshotID = id
                 self.foldersReady = true
-                if let path = self.selectedPath, !self.rows.contains(where: { $0.path == path }) {
+                if let path = self.selectedPath,
+                   !self.rows.contains(where: { $0.path == path }),
+                   !listed.folders.contains(path) {
                     self.selectedPath = nil
                 }
             }
@@ -740,7 +757,7 @@ final class AppModel: ObservableObject {
         let vault = URL(fileURLWithPath: library.vault)
         let snapshot = id
         let paths = folderPaths
-        let preferred = RestoreTarget.preferred(row: selectedRow, folders: paths)
+        let preferred = RestoreTarget.preferred(path: selectedPath, row: selectedRow, folders: paths)
         guard let path = FolderPickPanel(paths: paths, preferred: preferred).run() else { return }
         guard !working else {
             banner = "Chronicle is still finishing the last job."

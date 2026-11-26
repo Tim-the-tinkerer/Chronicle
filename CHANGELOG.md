@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.28
+
+- A version's files are shown as a folder tree. Open a folder to see what is inside it. The filter still finds a file by name.
+
+## 1.0.27
+
+- Add Folder lists the folders inside the one you picked, including a name like `.SynologyWorkingDirectory`, and leaves out the ones you check before the first snapshot starts.
+
 ## 1.0.26
 
 - A snapshot walks one folder at a time and does not keep every file's chunk list in memory. Stop still drops an unfinished version.

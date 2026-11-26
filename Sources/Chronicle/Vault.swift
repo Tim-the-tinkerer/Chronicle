@@ -2703,7 +2703,17 @@ enum Vault {
     }
 
 
-    private static func ensureConfig(vault: URL, source: URL, name: String) throws -> VaultConfig {
+    /// Writes `skipNames` before the first snapshot. An existing history keeps the list it already has.
+    static func prepare(vault: URL, source: URL, name: String, skipNames: [String]) throws {
+        if !SnapshotPlace.isReachable(vault.path) {
+            throw ChronicleError.fail("Snapshots are unavailable. Plug the drive back in.")
+        }
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        let sourceURL = URL(fileURLWithPath: source.resolvingSymlinksInPath().path, isDirectory: true)
+        _ = try ensureConfig(vault: vault, source: sourceURL, name: name, skipNames: FolderSetup.sanitize(skipNames))
+    }
+
+    private static func ensureConfig(vault: URL, source: URL, name: String, skipNames: [String] = VaultConfig.defaultSkip) throws -> VaultConfig {
         try FileManager.default.createDirectory(at: vault.appendingPathComponent("chunks"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: vault.appendingPathComponent("snapshots"), withIntermediateDirectories: true)
         let configURL = vault.appendingPathComponent("vault.json")
@@ -2721,7 +2731,7 @@ enum Vault {
             source: source.path,
             created: TimeText.nowISO(),
             chunk: .standard,
-            skipNames: VaultConfig.defaultSkip
+            skipNames: skipNames
         )
         try AppInfo.format.appending("\n").write(to: vault.appendingPathComponent("FORMAT"), atomically: true, encoding: .utf8)
         try JSONFile.write(config, to: configURL, pretty: true)

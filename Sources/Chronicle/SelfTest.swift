@@ -66,6 +66,8 @@ enum SelfTest {
             testThinningHistoryTotalsSinceLoggingBegan,
             testStreamingBrowseMatchesTheDiff,
             testSnapshotLeavesTheFileListEmpty,
+            testSetupLeavesOutAFolderBeforeTheFirstSnapshot,
+            testVersionTreeGroupsTheFiles,
         ]
         for test in tests {
             if let error = test() { return error }
@@ -543,6 +545,15 @@ enum SelfTest {
         }
         if RestoreTarget.preferred(row: gone, folders: ["blank"]) != nil { return "folder: a removed folder was still offered" }
         if RestoreTarget.preferred(row: nil, folders: folders) != nil { return "folder: no selection offered a folder" }
+        if RestoreTarget.preferred(path: "keep", row: nil, folders: folders) != "keep" {
+            return "folder: an unchanged folder was not offered"
+        }
+        if RestoreTarget.preferred(path: "top.txt", row: nil, folders: folders) != nil {
+            return "folder: a file path was offered as a folder"
+        }
+        if RestoreTarget.preferred(path: "top.txt", row: deep, folders: folders) != "notes/img" {
+            return "folder: a file row lost its folder"
+        }
         let listed = ["Games", "Games/cyber_llamas", "Audio scripts"]
         if FolderPickPanel.matching(listed, query: "CYBER") != ["Games/cyber_llamas"] {
             return "folder: the list filter missed a folder"
@@ -3490,6 +3501,192 @@ enum SelfTest {
         } catch {
             return "memory: \(error.localizedDescription)"
         }
+    }
+
+    /// The version browser groups files under their folders. An unchanged folder is still a folder.
+    private static func testVersionTreeGroupsTheFiles() -> String? {
+        func row(_ path: String, _ kind: String, _ change: String) -> BrowserRow {
+            BrowserRow(path: path, kind: kind, change: change, size: 1, newBytes: 0, chunkCount: 1)
+        }
+        let rows = [
+            row("keep.txt", "file", "same"),
+            row("notes/a.txt", "file", "same"),
+            row("notes/a.txt", "file", "changed"),
+            row("notes/img/pic.png", "file", "changed"),
+            row("notes/img", "dir", "added"),
+            row("gone/old.txt", "file", "removed"),
+            row("File10.txt", "file", "same"),
+            row("File2.txt", "file", "same"),
+        ]
+        let folders = ["notes", "notes/img", "real"]
+        let tree = FileTree.make(rows: rows, folders: folders)
+        let names = tree.map(\.name)
+        if names != ["gone", "notes", "real", "File2.txt", "File10.txt", "keep.txt"] {
+            return "tree: order was \(names)"
+        }
+        guard let notes = tree.first(where: { $0.path == "notes" }) else { return "tree: notes was missing" }
+        if notes.row != nil { return "tree: an unchanged folder was listed as a file row" }
+        if notes.children?.map(\.path) != ["notes/img", "notes/a.txt"] {
+            return "tree: notes held \(notes.children?.map(\.path) ?? [])"
+        }
+        if notes.children?.first(where: { $0.path == "notes/a.txt" })?.row?.change != "same" {
+            return "tree: a repeated path replaced the first row"
+        }
+        guard let img = notes.children?.first(where: { $0.path == "notes/img" }) else { return "tree: img was missing" }
+        if img.row?.change != "added" || img.children == nil {
+            return "tree: the added folder was not a folder"
+        }
+        if img.children?.map(\.path) != ["notes/img/pic.png"] {
+            return "tree: pic was not inside img"
+        }
+        guard let real = tree.first(where: { $0.path == "real" }) else { return "tree: the empty folder was missing" }
+        if real.row != nil || real.children?.isEmpty != true {
+            return "tree: the empty folder was \(real.children?.map(\.path) ?? [])"
+        }
+        guard let gone = tree.first(where: { $0.path == "gone" }) else { return "tree: the removed file had no folder" }
+        if gone.row != nil || gone.children?.map(\.path) != ["gone/old.txt"] || gone.children?.first?.row?.change != "removed" {
+            return "tree: the removed file was not grouped"
+        }
+        let filtered = FileTree.make(rows: rows, folders: folders, query: "pic")
+        if filtered.map(\.path) != ["notes"] {
+            return "tree: the filter roots were \(filtered.map(\.path))"
+        }
+        if filtered.first?.children?.map(\.path) != ["notes/img"] {
+            return "tree: the filter kept \(filtered.first?.children?.map(\.path) ?? [])"
+        }
+        if filtered.first?.children?.first?.children?.map(\.path) != ["notes/img/pic.png"] {
+            return "tree: the filter dropped the file"
+        }
+        let byFolder = FileTree.make(rows: rows, folders: folders, query: "img")
+        if byFolder.first?.children?.map(\.path) != ["notes/img"] {
+            return "tree: a folder filter kept \(byFolder.first?.children?.map(\.path) ?? [])"
+        }
+        if FileTree.make(rows: rows, folders: folders, query: "   ").map(\.path) != tree.map(\.path) {
+            return "tree: a blank filter hid files"
+        }
+        return nil
+    }
+
+    /// Add Folder writes the skip list before the first snapshot, so a dot folder is never read.
+    private static func testSetupLeavesOutAFolderBeforeTheFirstSnapshot() -> String? {
+        let added = FolderSetup.skipNames(
+            folders: [".SynologyWorkingDirectory", ".git", "notes"],
+            excluded: [".SynologyWorkingDirectory", ".git"]
+        )
+        var expected = VaultConfig.defaultSkip
+        expected.append(".SynologyWorkingDirectory")
+        if added != expected {
+            return "setup: skip names were \(added)"
+        }
+        let cleared = FolderSetup.skipNames(folders: [".git", "node_modules"], excluded: [])
+        let clearedExpected = VaultConfig.defaultSkip.filter { $0 != ".git" && $0 != "node_modules" }
+        if cleared != clearedExpected {
+            return "setup: clearing a folder changed \(cleared)"
+        }
+        if FolderSetup.skipNames(folders: ["notes"], excluded: [".SynologyWorkingDirectory"]) != VaultConfig.defaultSkip {
+            return "setup: a name that is not a listed folder was stored"
+        }
+        if FolderSetup.matching([".SynologyWorkingDirectory", "notes"], query: "synology") != [".SynologyWorkingDirectory"] {
+            return "setup: the filter missed the dot folder"
+        }
+        if FolderSetup.folders(in: URL(fileURLWithPath: "/no/such/chronicle-setup")).unreadable != true {
+            return "setup: a missing folder looked readable"
+        }
+
+        let root = temp("setup")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent(".SynologyWorkingDirectory/nested"), withIntermediateDirectories: true)
+            try Data("secret".utf8).write(to: source.appendingPathComponent(".SynologyWorkingDirectory/secret.txt"))
+            try Data("deep".utf8).write(to: source.appendingPathComponent(".SynologyWorkingDirectory/nested/deep.txt"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("notes/.SynologyWorkingDirectory"), withIntermediateDirectories: true)
+            try Data("also".utf8).write(to: source.appendingPathComponent("notes/.SynologyWorkingDirectory/also.txt"))
+            try Data("note".utf8).write(to: source.appendingPathComponent("notes/a.txt"))
+            try Data("keep".utf8).write(to: source.appendingPathComponent("keep.txt"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent(".git"), withIntermediateDirectories: true)
+            try Data("git".utf8).write(to: source.appendingPathComponent(".git/config"))
+            let real = source.appendingPathComponent("real")
+            try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+            try Data("inside".utf8).write(to: real.appendingPathComponent("inside.txt"))
+            try FileManager.default.createSymbolicLink(
+                atPath: source.appendingPathComponent("linkdir").path,
+                withDestinationPath: real.path
+            )
+            let listing = FolderSetup.folders(in: source)
+            if listing.unreadable { return "setup: the folder could not be listed" }
+            let wantedFolders = [".SynologyWorkingDirectory", ".git", "notes", "real"]
+            if listing.names != wantedFolders {
+                return "setup: listed \(listing.names)"
+            }
+            let excluded = Set(wantedFolders.filter { VaultConfig.defaultSkip.contains($0) }).union([".SynologyWorkingDirectory"])
+            let skip = FolderSetup.skipNames(folders: listing.names, excluded: excluded)
+            if !skip.contains(".SynologyWorkingDirectory") || !skip.contains(".git") {
+                return "setup: the stored list was \(skip)"
+            }
+            try Vault.prepare(vault: vault, source: source, name: "source", skipNames: skip)
+            try Vault.prepare(vault: vault, source: source, name: "source", skipNames: VaultConfig.defaultSkip)
+            if try Vault.config(vault).skipNames != skip {
+                return "setup: a second prepare replaced the skip list"
+            }
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "first", verify: false) else {
+                return "setup: snapshot was empty"
+            }
+            let paths = Set(snap.files.map(\.path))
+            for path in ["keep.txt", "notes", "notes/a.txt", "real", "real/inside.txt", "linkdir"] where !paths.contains(path) {
+                return "setup: \(path) was missing from \(paths.sorted())"
+            }
+            let hidden = [
+                ".SynologyWorkingDirectory",
+                ".SynologyWorkingDirectory/secret.txt",
+                ".SynologyWorkingDirectory/nested",
+                ".SynologyWorkingDirectory/nested/deep.txt",
+                "notes/.SynologyWorkingDirectory",
+                "notes/.SynologyWorkingDirectory/also.txt",
+                ".git",
+                ".git/config",
+            ]
+            for path in hidden where paths.contains(path) {
+                return "setup: \(path) was stored"
+            }
+            if !snap.skipped.contains(".SynologyWorkingDirectory") || !snap.skipped.contains("notes/.SynologyWorkingDirectory") {
+                return "setup: the dot folder was not recorded in \(snap.skipped)"
+            }
+            if snap.skipped.contains(".SynologyWorkingDirectory/secret.txt") {
+                return "setup: Chronicle read inside the excluded folder"
+            }
+            try Data("later".utf8).write(to: source.appendingPathComponent(".SynologyWorkingDirectory/later.txt"))
+            guard let again = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "setup: the next snapshot was empty"
+            }
+            if again.files.contains(where: { $0.path.hasPrefix(".SynologyWorkingDirectory") || $0.path.contains("/.SynologyWorkingDirectory") }) {
+                return "setup: a later snapshot read the excluded folder"
+            }
+            if try Vault.config(vault).skipNames != skip {
+                return "setup: the snapshot replaced the skip list"
+            }
+
+            let open = root.appendingPathComponent("open")
+            let openVault = root.appendingPathComponent("open-vault")
+            try FileManager.default.createDirectory(at: open.appendingPathComponent("node_modules/pkg"), withIntermediateDirectories: true)
+            try Data("mod".utf8).write(to: open.appendingPathComponent("node_modules/pkg/index.js"))
+            try Data("keep".utf8).write(to: open.appendingPathComponent("keep.txt"))
+            let openSkip = FolderSetup.skipNames(folders: ["node_modules"], excluded: [])
+            try Vault.prepare(vault: openVault, source: open, name: "open", skipNames: openSkip)
+            guard let stored = try Vault.snapshot(source: open, vault: openVault, label: "", reason: "first", verify: false) else {
+                return "setup: the cleared folder was not snapshotted"
+            }
+            if !stored.files.contains(where: { $0.path == "node_modules/pkg/index.js" }) {
+                return "setup: a cleared folder was still left out"
+            }
+            if !stored.files.contains(where: { $0.path == "keep.txt" }) {
+                return "setup: clearing a folder dropped the other file"
+            }
+        } catch {
+            return "setup: \(error.localizedDescription)"
+        }
+        return nil
     }
 
     private static func randomData(count: Int, seed: UInt64) -> Data {

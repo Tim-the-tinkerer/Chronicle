@@ -5,6 +5,9 @@ struct ContentView: View {
     /// Day ids the user has opened. The newest day is not in here; it stays open.
     @State private var expandedDays: Set<String> = []
     @State private var thinningOpen = false
+    /// Folders the user has opened in the version tree. A filter opens every folder it still shows.
+    @State private var openFolders: Set<String> = []
+    @State private var shownTree: [FileTree.Node] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -190,8 +193,10 @@ struct ContentView: View {
             .onChange(of: model.selection) { _ in
                 expandedDays = []
                 thinningOpen = false
+                openFolders = []
             }
             .onChange(of: model.selectedSnapshotID) { id in
+                openFolders = []
                 if let id {
                     if let day = versionDays.first(where: { !$0.opensFlat && $0.heads.contains { $0.id == id } }) {
                         expandedDays.insert(day.id)
@@ -233,24 +238,11 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             List(selection: $model.selectedPath) {
-                ForEach(shownRows) { row in
-                    HStack(spacing: 8) {
-                        Text(badge(row.change))
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(color(row.change))
-                            .frame(width: 58, alignment: .leading)
-                        Text(row.path)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Theme.text)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Text(row.change == "removed" ? "gone" : (row.kind == "dir" ? "folder" : ByteText.string(row.size)))
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Theme.muted)
-                    }
-                    .tag(row.path)
-                }
+                VersionTree(
+                    nodes: shownTree,
+                    openFolders: $openFolders,
+                    filtering: !model.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
@@ -258,6 +250,14 @@ struct ContentView: View {
             restoreBar
         }
         .background(Theme.bg)
+        .onAppear { rebuildTree() }
+        .onChange(of: model.rows) { _ in rebuildTree() }
+        .onChange(of: model.folderPaths) { _ in rebuildTree() }
+        .onChange(of: model.filter) { _ in rebuildTree() }
+    }
+
+    private func rebuildTree() {
+        shownTree = FileTree.make(rows: model.rows, folders: model.folderPaths, query: model.filter)
     }
 
     private var detail: some View {
@@ -268,8 +268,14 @@ struct ContentView: View {
                     .foregroundStyle(Theme.muted)
                     .lineLimit(1)
                     .truncationMode(.middle)
+            } else if let path = model.selectedPath, model.folderPaths.contains(path) {
+                Text("\(path)  ·  folder")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             } else {
-                Text("Select a file to see what this version kept.")
+                Text("Select a file or folder to see what this version kept.")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.muted)
             }
@@ -484,12 +490,6 @@ struct ContentView: View {
             .fixedSize()
     }
 
-    private var shownRows: [BrowserRow] {
-        let query = model.filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return model.rows }
-        return model.rows.filter { $0.path.lowercased().contains(query) }
-    }
-
     private func versionDetail(_ head: SnapshotHead) -> String {
         let stats = head.stats
         let glance = model.glances[head.id]
@@ -509,7 +509,7 @@ struct ContentView: View {
 
     private func detailLine(_ row: BrowserRow) -> String {
         if row.kind == "dir" {
-            return "\(row.path)  ·  \(word(row.change)) folder"
+            return "\(row.path)  ·  \(Self.word(row.change)) folder"
         }
         if row.change == "carried" {
             return "\(row.path)  ·  carried forward. Chronicle could not read the current file."
@@ -517,10 +517,10 @@ struct ContentView: View {
         if row.change == "unread" {
             return "\(row.path)  ·  unreadable. This version does not have it."
         }
-        return "\(row.path)  ·  \(word(row.change))  ·  \(row.chunkCount) chunks  ·  \(ByteText.string(row.newBytes)) new since the previous version"
+        return "\(row.path)  ·  \(Self.word(row.change))  ·  \(row.chunkCount) chunks  ·  \(ByteText.string(row.newBytes)) new since the previous version"
     }
 
-    private func badge(_ change: String) -> String {
+    private static func badge(_ change: String) -> String {
         switch change {
         case "added": return "ADDED"
         case "changed": return "CHANGED"
@@ -531,7 +531,7 @@ struct ContentView: View {
         }
     }
 
-    private func word(_ change: String) -> String {
+    private static func word(_ change: String) -> String {
         switch change {
         case "added": return "added"
         case "changed": return "changed"
@@ -542,12 +542,72 @@ struct ContentView: View {
         }
     }
 
-    private func color(_ change: String) -> Color {
+    private static func color(_ change: String) -> Color {
         switch change {
         case "added": return Theme.green
         case "changed": return Theme.amber
         case "removed", "carried", "unread": return Theme.danger
         default: return Theme.muted
+        }
+    }
+
+    private struct VersionTree: View {
+        let nodes: [FileTree.Node]
+        @Binding var openFolders: Set<String>
+        let filtering: Bool
+
+        var body: some View {
+            ForEach(nodes) { node in
+                if let children = node.children {
+                    DisclosureGroup(isExpanded: expanded(node.path)) {
+                        VersionTree(nodes: children, openFolders: $openFolders, filtering: filtering)
+                    } label: {
+                        label(node).tag(node.path)
+                    }
+                } else {
+                    label(node).tag(node.path)
+                }
+            }
+        }
+
+        private func expanded(_ path: String) -> Binding<Bool> {
+            Binding(
+                get: { filtering || openFolders.contains(path) },
+                set: { open in
+                    if filtering { return }
+                    if open {
+                        openFolders.insert(path)
+                    } else {
+                        openFolders.remove(path)
+                    }
+                }
+            )
+        }
+
+        private func label(_ node: FileTree.Node) -> some View {
+            HStack(spacing: 8) {
+                Text(node.row.map { ContentView.badge($0.change) } ?? "")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(node.row.map { ContentView.color($0.change) } ?? Theme.muted)
+                    .frame(width: 58, alignment: .leading)
+                Text(node.name)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text(trailing(node))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+
+        private func trailing(_ node: FileTree.Node) -> String {
+            if node.children != nil {
+                return node.row?.change == "removed" ? "gone" : "folder"
+            }
+            if node.row?.change == "removed" { return "gone" }
+            return ByteText.string(node.row?.size ?? 0)
         }
     }
 

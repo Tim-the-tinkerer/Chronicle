@@ -365,6 +365,14 @@ enum RestoreTarget {
         }
         return nil
     }
+
+    /// A selected folder that has no file row, because it did not change, is still that folder.
+    /// A file row keeps the folder `preferred(row:folders:)` already chose.
+    static func preferred(path: String?, row: BrowserRow?, folders: [String]) -> String? {
+        if let chosen = preferred(row: row, folders: folders) { return chosen }
+        guard let path, !path.isEmpty, folders.contains(path) else { return nil }
+        return path
+    }
 }
 
 enum RelPath {
@@ -882,6 +890,108 @@ struct BrowserRow: Identifiable, Equatable {
 struct VersionBrowse: Equatable {
     var rows: [BrowserRow]
     var folders: [String]
+}
+
+/// The folders and files of one version, grouped so a folder opens onto its contents.
+/// An unchanged directory stays out of `rows` and is still a folder here when `folders` names it.
+enum FileTree {
+    struct Node: Equatable, Identifiable {
+        var name: String
+        var path: String
+        var row: BrowserRow?
+        /// Nil for a file or link. An empty array is a folder with nothing inside it.
+        var children: [Node]?
+        var id: String { path }
+    }
+
+    static func make(rows: [BrowserRow], folders: [String], query: String = "") -> [Node] {
+        var rowByPath: [String: BrowserRow] = [:]
+        rowByPath.reserveCapacity(rows.count)
+        for row in rows where !row.path.isEmpty && rowByPath[row.path] == nil {
+            rowByPath[row.path] = row
+        }
+        var paths = Set<String>()
+        var isDir = Set<String>()
+        paths.reserveCapacity(rows.count + folders.count)
+        isDir.reserveCapacity(folders.count)
+
+        func ensure(_ path: String, directory: Bool) {
+            if path.isEmpty { return }
+            paths.insert(path)
+            if directory { isDir.insert(path) }
+            var parent = path
+            while let slash = parent.lastIndex(of: "/") {
+                parent = String(parent[..<slash])
+                if parent.isEmpty { break }
+                isDir.insert(parent)
+                if !paths.insert(parent).inserted { break }
+            }
+        }
+
+        for folder in folders {
+            ensure(folder, directory: true)
+        }
+        for (path, row) in rowByPath {
+            ensure(path, directory: row.kind == "dir")
+        }
+
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !needle.isEmpty {
+            var keep = Set<String>()
+            for path in paths where path.lowercased().contains(needle) {
+                var current = path
+                while true {
+                    if !keep.insert(current).inserted { break }
+                    guard let slash = current.lastIndex(of: "/") else { break }
+                    current = String(current[..<slash])
+                    if current.isEmpty { break }
+                }
+            }
+            paths = keep
+        }
+
+        var children: [String: [String]] = [:]
+        for path in paths {
+            let parent: String
+            if let slash = path.lastIndex(of: "/") {
+                parent = String(path[..<slash])
+            } else {
+                parent = ""
+            }
+            children[parent, default: []].append(path)
+        }
+
+        func isFolder(_ path: String) -> Bool {
+            if let row = rowByPath[path] { return row.kind == "dir" }
+            return isDir.contains(path)
+        }
+
+        func ordered(_ lhs: String, _ rhs: String) -> Bool {
+            let lhsFolder = isFolder(lhs)
+            if lhsFolder != isFolder(rhs) { return lhsFolder }
+            let lhsName = leaf(lhs)
+            let rhsName = leaf(rhs)
+            let compared = lhsName.localizedStandardCompare(rhsName)
+            if compared == .orderedSame { return lhs < rhs }
+            return compared == .orderedAscending
+        }
+
+        func node(_ path: String) -> Node {
+            let row = rowByPath[path]
+            if isFolder(path) {
+                let kids = (children[path] ?? []).sorted(by: ordered).map(node)
+                return Node(name: leaf(path), path: path, row: row, children: kids)
+            }
+            return Node(name: leaf(path), path: path, row: row, children: nil)
+        }
+
+        return (children[""] ?? []).sorted(by: ordered).map(node)
+    }
+
+    private static func leaf(_ path: String) -> String {
+        guard let slash = path.lastIndex(of: "/") else { return path }
+        return String(path[path.index(after: slash)...])
+    }
 }
 
 enum Diff {

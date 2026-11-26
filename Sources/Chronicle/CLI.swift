@@ -27,6 +27,7 @@ enum CLI {
     --verify reads every file. An automatic version is kept when a file, link, or directory changed. A directory's modification time alone does not count.
     verify reads every version file, then checks every stored chunk and names the versions a missing or damaged chunk affects.
     Skipped names: \(VaultConfig.defaultSkip.joined(separator: ", ")).
+    Add Folder can leave out more folders, including a name that starts with a dot, before the first snapshot. That list is stored in the vault.
     """
 
     static func run(_ args: [String]) -> Never {

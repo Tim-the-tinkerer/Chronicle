@@ -5,6 +5,8 @@ struct ChronicleError: LocalizedError, CustomStringConvertible {
         case general
         /// `snapshots/` exists and could not be listed. Matched by identity, not by the sentence.
         case versionListUnreadable
+        /// The user stopped the snapshot before its version was saved.
+        case snapshotCancelled
     }
 
     var message: String
@@ -18,6 +20,10 @@ struct ChronicleError: LocalizedError, CustomStringConvertible {
 
     static var versionListUnreadable: ChronicleError {
         ChronicleError(message: "The version list could not be read.", code: .versionListUnreadable)
+    }
+
+    static var snapshotCancelled: ChronicleError {
+        ChronicleError(message: "Stopped. The version was not saved.", code: .snapshotCancelled)
     }
 }
 

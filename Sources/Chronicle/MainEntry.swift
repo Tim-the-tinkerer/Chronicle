@@ -141,7 +141,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         show.target = self
         menu.addItem(show)
         menu.addItem(.separator())
-        if model.busy {
+        if model.snapshotActive {
+            let title = model.snapshotStopping ? "Stopping…" : "Stop Snapshot"
+            let stop = NSMenuItem(title: title, action: #selector(stopSnapshot(_:)), keyEquivalent: "")
+            stop.target = self
+            stop.isEnabled = !model.snapshotStopping
+            menu.addItem(stop)
+        } else if model.busy {
             let busy = NSMenuItem(title: model.banner.isEmpty ? "Saving a version…" : model.banner, action: nil, keyEquivalent: "")
             busy.isEnabled = false
             menu.addItem(busy)
@@ -186,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func addFolder(_ sender: Any?) { model.addFolder() }
     @objc private func snapshot(_ sender: Any?) { model.takeSnapshot() }
+    @objc private func stopSnapshot(_ sender: Any?) { model.stopSnapshot() }
     @objc private func reread(_ sender: Any?) { model.takeSnapshot(reason: "manual", verify: true) }
     @objc private func restore(_ sender: Any?) { model.restoreSelected() }
     @objc private func restoreFile(_ sender: Any?) { model.restoreSelectedFile() }
@@ -245,6 +252,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let rereadItem = fileMenu.addItem(withTitle: "Re-read Every File", action: #selector(reread(_:)), keyEquivalent: "s")
         rereadItem.keyEquivalentModifierMask = [.command, .option]
         rereadItem.target = self
+        let stopItem = fileMenu.addItem(withTitle: "Stop Snapshot", action: #selector(stopSnapshot(_:)), keyEquivalent: ".")
+        stopItem.target = self
         fileMenu.addItem(.separator())
         let restoreItem = fileMenu.addItem(withTitle: "Restore Version…", action: #selector(restore(_:)), keyEquivalent: "r")
         restoreItem.keyEquivalentModifierMask = [.command, .shift]
@@ -293,5 +302,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         NSApp.windowsMenu = windowMenu
 
         NSApp.mainMenu = main
+    }
+
+    /// AppKit asks this for every item whose target is the delegate. Other actions stay enabled.
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(stopSnapshot(_:)) {
+            return model.snapshotActive && !model.snapshotStopping
+        }
+        if menuItem.action == #selector(snapshotLibrary(_:)) {
+            guard let id = menuItem.representedObject as? String,
+                  let library = model.libraries.first(where: { $0.id == id }) else { return false }
+            let status = BarStatus.line(
+                name: library.name,
+                policy: library.policy,
+                dirty: model.isDirty(library.id),
+                sourceExists: FileManager.default.fileExists(atPath: library.source),
+                vaultReachable: SnapshotPlace.isReachable(library.vault)
+            )
+            return status.canSnapshot && !model.busy
+        }
+        return true
     }
 }

@@ -4,7 +4,7 @@ A personal time machine for one folder at a time. Chronicle watches the folder a
 
 The cost of a full copy, times the number of versions, is what history usually costs. Chronicle keeps the new bytes.
 
-**Version:** 1.0.24 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
+**Version:** 1.0.25 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
 
 ## What you see
 
@@ -16,7 +16,7 @@ Add a folder. The first snapshot reads it. After that, the header is the product
 
 A version row says how many new bytes it stored, and how large a full copy of the folder would have been. Pick a version to see which files were added, changed, or removed, and how much of a changed file is actually new. A file whose only change is its permissions is shown as changed.
 
-Snapshot (⌘S) writes a version now. A second request while one is running waits its turn. Re-read Every File (⌥⌘S) reads every byte, including files whose size and modification time did not change. Restore writes a new folder somewhere else, one file, or one folder from the version and the files inside it. Restore Folder lists every folder in that version, including ones the file list hides, then asks where to write that folder. The place is chosen only after the list has closed. Approving a replace writes that file beside the one already there and puts it in place only after every chunk has been read. A damaged chunk leaves the original file where it is. Delete Version drops that manifest and the chunks no other version uses.
+Snapshot (⌘S) writes a version now. Stop Snapshot (⌘.) ends that snapshot before the version is saved. A second request while one is running waits its turn. Re-read Every File (⌥⌘S) reads every byte, including files whose size and modification time did not change. Restore writes a new folder somewhere else, one file, or one folder from the version and the files inside it. Restore Folder lists every folder in that version, including ones the file list hides, then asks where to write that folder. The place is chosen only after the list has closed. Approving a replace writes that file beside the one already there and puts it in place only after every chunk has been read. A damaged chunk leaves the original file where it is. Delete Version drops that manifest and the chunks no other version uses.
 
 The schedule is every 15 minutes by default. It can be hourly, daily, or manual. One folder that is missing, or whose drive is unplugged, does not keep the others from saving. An automatic check that finds nothing waits out that folder's interval. An automatic version is written when a file, a symlink, or a directory was added, removed, or changed. A directory whose only change is its modification time does not count. Opening the folder in Finder moves that time when it writes a skipped name such as `.DS_Store`. The same unreadable folder, or the same unreadable file, does not start another automatic version. The first time a path cannot be read, Chronicle saves one. A version saved for another reason still says how many files were carried forward. A manual snapshot still saves.
 

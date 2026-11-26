@@ -1,6 +1,31 @@
 import AppKit
 import Foundation
 
+/// The main thread raises this. The snapshot queue reads it.
+private final class SnapshotCancel: @unchecked Sendable {
+    private let lock = NSLock()
+    private var raised = false
+
+    func raise() {
+        lock.lock()
+        raised = true
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        raised = false
+        lock.unlock()
+    }
+
+    func isSet() -> Bool {
+        lock.lock()
+        let value = raised
+        lock.unlock()
+        return value
+    }
+}
+
 final class AppModel: ObservableObject {
     @Published var libraries: [Library] = []
     @Published var selection: String?
@@ -17,6 +42,10 @@ final class AppModel: ObservableObject {
     @Published var banner = ""
     @Published var progressPath = ""
     @Published var busy = false
+    /// True only while a snapshot is the job that set `busy`. Restore and the other jobs do not.
+    @Published var snapshotActive = false
+    /// The user asked the running snapshot to stop. The button stays disabled until it finishes.
+    @Published var snapshotStopping = false
     @Published var totals: VaultTotals?
     @Published var latestDate: Date?
     @Published var skipLine = ""
@@ -38,6 +67,7 @@ final class AppModel: ObservableObject {
     private var pendingUser: [(id: String, reason: String, verify: Bool)] = []
     /// A schedule check is reading the vault off the main thread.
     private var scheduling = false
+    private let snapshotCancel = SnapshotCancel()
     private let defaultsKey = "chronicle.library"
     private let snapshotRootKey = "chronicle.snapshotRoot"
     private var started = false
@@ -327,6 +357,11 @@ final class AppModel: ObservableObject {
             return
         }
         if working {
+            // Stop is already winding this snapshot down. Queuing would start the next
+            // folder the moment it ends.
+            if snapshotStopping {
+                return
+            }
             if reason != "catchup" {
                 pendingUser.append((id, reason, verify))
             }
@@ -344,6 +379,9 @@ final class AppModel: ObservableObject {
         }
         working = true
         busy = true
+        snapshotActive = true
+        snapshotStopping = false
+        snapshotCancel.clear()
         progressPath = ""
         listEpoch += 1
         refreshPending = true
@@ -358,6 +396,7 @@ final class AppModel: ObservableObject {
         let label = stampLabel ? labelText.trimmingCharacters(in: .whitespacesAndNewlines) : ""
         let source = URL(fileURLWithPath: library.source)
         let vault = URL(fileURLWithPath: library.vault)
+        let cancelFlag = snapshotCancel
         var lastProgress = Date.distantPast
         work.async {
             do {
@@ -366,18 +405,22 @@ final class AppModel: ObservableObject {
                     vault: vault,
                     label: label,
                     reason: reason,
-                    verify: verify
-                ) { path in
-                    let now = Date()
-                    if now.timeIntervalSince(lastProgress) < 0.08 { return }
-                    lastProgress = now
-                    DispatchQueue.main.async { self.progressPath = path }
-                }
+                    verify: verify,
+                    progress: { path in
+                        let now = Date()
+                        if now.timeIntervalSince(lastProgress) < 0.08 { return }
+                        lastProgress = now
+                        DispatchQueue.main.async { self.progressPath = path }
+                    },
+                    isCancelled: { cancelFlag.isSet() }
+                )
                 let heads = try Vault.listHeads(vault)
                 let shown = Vault.rowGlances(vault: vault, heads: heads)
                 let totals = try Vault.totals(vault)
                 let skip = (try? Vault.config(vault).skipNames.joined(separator: ", ")) ?? VaultConfig.defaultSkip.joined(separator: ", ")
                 DispatchQueue.main.async {
+                    // finishWork clears the flag. Read it first, or a late stop looks like a normal save.
+                    let stoppedLate = cancelFlag.isSet()
                     let stillHere = self.selection == id
                     if stillHere { self.refreshPending = false }
                     self.finishWork()
@@ -414,24 +457,55 @@ final class AppModel: ObservableObject {
                             line += " " + self.thinNote
                         }
                         self.thinNote = ""
+                        if stoppedLate {
+                            line += " Stop came after this version was saved."
+                        }
                         self.banner = stillHere ? line : "\(name): \(line)"
                     } else if reason == "catchup" {
-                        if self.banner.hasPrefix("Checking") { self.banner = self.thinNote }
+                        if self.banner.hasPrefix("Checking") || stoppedLate { self.banner = self.thinNote }
                     } else if stillHere {
                         self.banner = "Nothing changed."
-                    } else if self.banner == "Reading the folder…" {
+                    } else if self.banner == "Reading the folder…" || stoppedLate {
                         self.banner = self.thinNote
                     }
-                    self.resumeWork(completion)
+                    if stoppedLate {
+                        self.pendingUser.removeAll()
+                        self.catchUpQueue.removeAll()
+                    } else {
+                        self.resumeWork(completion)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
+                    let cancelled = (error as? ChronicleError)?.code == .snapshotCancelled
                     self.finishWork()
-                    self.banner = error.localizedDescription
-                    self.resumeWork(completion)
+                    if cancelled {
+                        self.banner = "Stopped. The version was not saved."
+                        self.lastAutomaticCheck[id] = Date()
+                        self.pendingUser.removeAll()
+                        self.catchUpQueue.removeAll()
+                    } else {
+                        self.banner = error.localizedDescription
+                        self.resumeWork(completion)
+                    }
                 }
             }
         }
+    }
+
+    /// Asks the running snapshot to stop before the version is published.
+    func stopSnapshot() {
+        guard snapshotActive, !snapshotStopping else {
+            if !snapshotActive {
+                banner = "No snapshot is running."
+            }
+            return
+        }
+        snapshotStopping = true
+        snapshotCancel.raise()
+        pendingUser.removeAll()
+        catchUpQueue.removeAll()
+        banner = "Stopping…"
     }
 
     private func resumeWork(_ completion: (() -> Void)?) {
@@ -1041,6 +1115,9 @@ final class AppModel: ObservableObject {
     private func finishWork() {
         working = false
         busy = false
+        snapshotActive = false
+        snapshotStopping = false
+        snapshotCancel.clear()
         progressPath = ""
         if refreshPending {
             refreshPending = false

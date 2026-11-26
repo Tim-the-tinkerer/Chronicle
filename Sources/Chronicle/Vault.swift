@@ -354,7 +354,8 @@ enum Vault {
         label: String,
         reason: String,
         verify: Bool,
-        progress: ((String) -> Void)? = nil
+        progress: ((String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
     ) throws -> Snapshot? {
         if !SnapshotPlace.isReachable(vault.path) {
             throw ChronicleError.fail("Snapshots are unavailable. Plug the drive back in.")
@@ -392,16 +393,25 @@ enum Vault {
         }
 
         let parent = try newestBody(vault)
-        let walked = try collect(source: sourceURL, vault: vault, skip: Set(config.skipNames), progress: progress)
+        try stopIfCancelled(isCancelled)
+        let walked = try collect(
+            source: sourceURL,
+            vault: vault,
+            skip: Set(config.skipNames),
+            progress: progress,
+            isCancelled: isCancelled
+        )
         let built = try buildContents(
             walked: walked,
             parent: parent,
             skip: Set(config.skipNames),
             verify: verify,
             policy: .store(store, config.chunk),
-            progress: progress
+            progress: progress,
+            isCancelled: isCancelled
         )
 
+        try stopIfCancelled(isCancelled)
         guard Snapshot.shouldKeep(
             reason: reason,
             stats: built.stats,
@@ -411,7 +421,9 @@ enum Vault {
             skip: Set(config.skipNames)
         ) else { return nil }
 
+        try stopIfCancelled(isCancelled)
         let rootTree = try writeTrees(built.files, store: trees)
+        try stopIfCancelled(isCancelled)
         var snap = Snapshot(
             format: AppInfo.format,
             id: SnapshotID.make(),
@@ -458,14 +470,15 @@ enum Vault {
         let baseline = try? listHeads(vault).first?.id
         let parent = try newestBody(vault)
         let skip = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
-        let walked = try collect(source: sourceURL, vault: vault, skip: skip, progress: nil)
+        let walked = try collect(source: sourceURL, vault: vault, skip: skip, progress: nil, isCancelled: nil)
         let built = try buildContents(
             walked: walked,
             parent: parent,
             skip: skip,
             verify: false,
             policy: .probe,
-            progress: nil
+            progress: nil,
+            isCancelled: nil
         )
         let after = try? listHeads(vault).first?.id
         if after != baseline {
@@ -1680,7 +1693,8 @@ enum Vault {
         skip: Set<String>,
         verify: Bool,
         policy: ReadPolicy,
-        progress: ((String) -> Void)?
+        progress: ((String) -> Void)?,
+        isCancelled: (() -> Bool)?
     ) throws -> (files: [Entry], skipped: [String], stats: SnapshotStats) {
         let parentMap = entriesByPath(parent?.files ?? [])
         var files: [Entry] = []
@@ -1689,6 +1703,7 @@ enum Vault {
         let accum = ChunkAccum()
 
         for item in walked.items {
+            try stopIfCancelled(isCancelled)
             progress?(item.relative)
             switch item.kind {
             case "dir":
@@ -1767,7 +1782,7 @@ enum Vault {
                 guard case .store(let store, let params) = policy else { continue }
                 accum.reset()
                 do {
-                    try ingest(item.absolute, params: params, store: store, accum: accum)
+                    try ingest(item.absolute, params: params, store: store, accum: accum, isCancelled: isCancelled)
                 } catch let error as ChronicleError {
                     // The vault could not store the chunk. Saving the file as unreadable
                     // would publish a version that does not have these bytes.
@@ -1800,6 +1815,7 @@ enum Vault {
                 stats.newChunkBytes += accum.newBytes
                 stats.reusedChunkBytes += accum.reusedBytes
                 classify(entry, parent: parentMap[item.relative], stats: &stats, newBytes: accum.newBytes, reusedBytes: accum.reusedBytes)
+                try stopIfCancelled(isCancelled)
             default:
                 skipped.append(item.relative)
             }
@@ -1906,11 +1922,18 @@ enum Vault {
         _ = reusedBytes
     }
 
-    private static func ingest(_ path: String, params: ChunkParams, store: ChunkStore, accum: ChunkAccum) throws {
+    private static func ingest(
+        _ path: String,
+        params: ChunkParams,
+        store: ChunkStore,
+        accum: ChunkAccum,
+        isCancelled: (() -> Bool)?
+    ) throws {
         let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? handle.close() }
         let splitter = ChunkSplitter(params: params)
         splitter.onChunk = { data in
+            try stopIfCancelled(isCancelled)
             let (hash, isNew) = try store.put(data)
             accum.chunks.append(hash)
             accum.lengths.append(data.count)
@@ -1918,6 +1941,7 @@ enum Vault {
             else { accum.reusedBytes += Int64(data.count) }
         }
         while true {
+            try stopIfCancelled(isCancelled)
             let piece = try handle.read(upToCount: 256 * 1024) ?? Data()
             if piece.isEmpty { break }
             try splitter.feed(piece)
@@ -1925,11 +1949,18 @@ enum Vault {
         try splitter.finish()
     }
 
+    private static func stopIfCancelled(_ isCancelled: (() -> Bool)?) throws {
+        if isCancelled?() == true {
+            throw ChronicleError.snapshotCancelled
+        }
+    }
+
     private static func collect(
         source: URL,
         vault: URL,
         skip: Set<String>,
-        progress: ((String) -> Void)?
+        progress: ((String) -> Void)?,
+        isCancelled: (() -> Bool)?
     ) throws -> (items: [WalkItem], skipped: [String]) {
         let rootPath = source.path
         let vaultPath = vault.resolvingSymlinksInPath().path
@@ -1949,6 +1980,7 @@ enum Vault {
 
         var items: [WalkItem] = []
         while let url = enumerator.nextObject() as? URL {
+            try stopIfCancelled(isCancelled)
             let name = url.lastPathComponent
             let path = url.path
             let relative = relativePath(path, rootPath)

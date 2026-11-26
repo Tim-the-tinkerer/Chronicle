@@ -24,6 +24,7 @@ enum SelfTest {
             testEmptyDirectoryTriggersWatch,
             testManifestIsTheCommit,
             testFailureBeforeManifestRollsBack,
+            testStopLeavesThePreviousVersion,
             testCatchUpSavesAVersion,
             testCarriedForwardIsVisible,
             testRepeatedUnreadableFolderDoesNotSave,
@@ -915,6 +916,102 @@ enum SelfTest {
             return nil
         } catch {
             return "rollback: \(error.localizedDescription)"
+        }
+    }
+
+    private static func testStopLeavesThePreviousVersion() -> String? {
+        let root = temp("stop")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            try Data("keep".utf8).write(to: source.appendingPathComponent("keep.txt"))
+            guard let first = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "stop: first snapshot was empty"
+            }
+            let fresh = randomData(count: 300, seed: 77)
+            try fresh.write(to: source.appendingPathComponent("a-new.bin"))
+            try Data("b-new".utf8).write(to: source.appendingPathComponent("b-new.txt"))
+            // collect reports each path once, then buildContents reports it again.
+            // The second report of b-new.txt is after a-new.bin has been stored.
+            // Stopping on that read discards the new chunk and does not publish.
+            let reports = StopReports()
+            do {
+                _ = try Vault.snapshot(
+                    source: source,
+                    vault: vault,
+                    label: "",
+                    reason: "manual",
+                    verify: false,
+                    progress: { reports.note($0) },
+                    isCancelled: { reports.count("b-new.txt") >= 2 }
+                )
+                return "stop: snapshot published a version"
+            } catch let error as ChronicleError {
+                if error.code != .snapshotCancelled || error.message != "Stopped. The version was not saved." {
+                    return "stop: \(error.message)"
+                }
+            }
+            if reports.count("a-new.bin") < 2 {
+                return "stop: a-new.bin was not read before the stop"
+            }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: vault.appendingPathComponent("snapshots").path)) ?? []
+            if names.contains(where: { $0.hasSuffix(".partial") }) {
+                return "stop: a partial manifest was left behind"
+            }
+            if try Vault.listHeads(vault).map(\.id) != [first.id] {
+                return "stop: the stopped version appeared"
+            }
+            if FileManager.default.fileExists(atPath: chunkFile(vault, Digest.sha256(fresh)).path) {
+                return "stop: chunk survived a stopped snapshot"
+            }
+            if FileManager.default.fileExists(atPath: vault.appendingPathComponent("pending").path) {
+                return "stop: pending marker was left behind"
+            }
+            let dest = root.appendingPathComponent("out")
+            try Vault.restore(vault: vault, snapshot: first.id, dest: dest, allowInsideSource: false)
+            if try Data(contentsOf: dest.appendingPathComponent("keep.txt")) != Data("keep".utf8) {
+                return "stop: the previous version changed"
+            }
+            if FileManager.default.fileExists(atPath: dest.appendingPathComponent("a-new.bin").path) {
+                return "stop: the stopped version's file was restored"
+            }
+            guard let saved = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "stop: the later snapshot was empty"
+            }
+            let again = root.appendingPathComponent("out2")
+            try Vault.restore(vault: vault, snapshot: saved.id, dest: again, allowInsideSource: false)
+            if try Data(contentsOf: again.appendingPathComponent("keep.txt")) != Data("keep".utf8) {
+                return "stop: keep.txt was missing from the later version"
+            }
+            if try Data(contentsOf: again.appendingPathComponent("a-new.bin")) != fresh {
+                return "stop: a-new.bin was missing from the later version"
+            }
+            do {
+                _ = try Vault.snapshot(
+                    source: source,
+                    vault: vault,
+                    label: "",
+                    reason: "manual",
+                    verify: false,
+                    isCancelled: { true }
+                )
+                return "stop: an immediate stop was saved"
+            } catch let error as ChronicleError {
+                if error.code != .snapshotCancelled || error.message != "Stopped. The version was not saved." {
+                    return "stop: \(error.message)"
+                }
+            }
+            if try Vault.listHeads(vault).map(\.id) != [saved.id, first.id] {
+                return "stop: versions changed after an immediate stop"
+            }
+            if FileManager.default.fileExists(atPath: vault.appendingPathComponent("pending").path) {
+                return "stop: pending marker survived an immediate stop"
+            }
+            return nil
+        } catch {
+            return "stop: \(error.localizedDescription)"
         }
     }
 
@@ -2276,6 +2373,19 @@ enum SelfTest {
             }
         }
         return dirs.allSatisfy { chmod($0.path, mode) == 0 }
+    }
+
+    /// Counts progress reports. The snapshot calls the closure on the same thread.
+    private final class StopReports {
+        private var counts: [String: Int] = [:]
+
+        func note(_ path: String) {
+            counts[path, default: 0] += 1
+        }
+
+        func count(_ path: String) -> Int {
+            counts[path] ?? 0
+        }
     }
 
     private static func chunkFile(_ vault: URL, _ hash: String) -> URL {

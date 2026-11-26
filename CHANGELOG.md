@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.25
+
+- Stop ends a snapshot before the version is saved. The previous version stays, and chunks from the attempt are removed. A stop that arrives after the version is saved says so.
+
 ## 1.0.24
 
 - Restore Folder opens a folder list, and only after that list closes does it ask where to write the folder. Choosing a place starts the restore. The button stays on its own row.

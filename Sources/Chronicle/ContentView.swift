@@ -204,9 +204,15 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Label", text: $model.labelText)
                     .textFieldStyle(.roundedBorder)
-                Button(model.busy ? "Working…" : "Snapshot") { model.takeSnapshot() }
-                    .buttonStyle(ChronicleButtonStyle(kind: .primary))
-                    .disabled(model.busy)
+                Button(snapshotButtonTitle) {
+                    if model.snapshotActive {
+                        model.stopSnapshot()
+                    } else {
+                        model.takeSnapshot()
+                    }
+                }
+                    .buttonStyle(ChronicleButtonStyle(kind: model.snapshotActive ? .danger : .primary))
+                    .disabled((model.busy && !model.snapshotActive) || model.snapshotStopping)
             }
             .padding(12)
         }
@@ -274,11 +280,18 @@ struct ContentView: View {
         .background(Theme.panel)
     }
 
+    private var snapshotButtonTitle: String {
+        if model.snapshotStopping { return "Stopping…" }
+        if model.snapshotActive { return "Stop" }
+        if model.busy { return "Working…" }
+        return "Snapshot"
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             if model.busy {
                 ProgressView().controlSize(.small)
-                Text(model.progressPath.isEmpty ? model.banner : model.progressPath)
+                Text(model.snapshotStopping || model.progressPath.isEmpty ? model.banner : model.progressPath)
                     .lineLimit(1)
                     .truncationMode(.middle)
             } else if !model.banner.isEmpty {

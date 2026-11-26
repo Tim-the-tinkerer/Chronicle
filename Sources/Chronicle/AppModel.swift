@@ -612,9 +612,9 @@ final class AppModel: ObservableObject {
         let libraryID = library.id
         let vault = URL(fileURLWithPath: library.vault)
         work.async {
-            let snap: Snapshot
+            let listed: VersionBrowse
             do {
-                snap = try Vault.load(vault, id)
+                listed = try Vault.listVersion(vault, id)
             } catch {
                 DispatchQueue.main.async {
                     guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
@@ -626,24 +626,13 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
-            let basis = Vault.compared(vault: vault, to: snap)
-            let names = Set((try? Vault.config(vault).skipNames) ?? VaultConfig.defaultSkip)
-            let warnings = snap.warnings(skipNames: names)
-            let rows = Diff.rows(
-                current: snap.files,
-                parent: basis.parent?.files,
-                comparable: basis.comparable,
-                carried: warnings.carried,
-                unread: warnings.unread
-            )
-            let folders = snap.files.compactMap { $0.kind == "dir" ? $0.path : nil }.sorted()
             DispatchQueue.main.async {
                 guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
-                self.rows = rows
-                self.folderPaths = folders
+                self.rows = listed.rows
+                self.folderPaths = listed.folders
                 self.folderSnapshotID = id
                 self.foldersReady = true
-                if let path = self.selectedPath, !rows.contains(where: { $0.path == path }) {
+                if let path = self.selectedPath, !self.rows.contains(where: { $0.path == path }) {
                     self.selectedPath = nil
                 }
             }

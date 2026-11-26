@@ -1,25 +1,11 @@
 import Darwin
 import Foundation
 
-private struct WalkItem {
-    var relative: String
-    var kind: String
-    var mode: UInt32
-    var mtimeNS: Int64
-    var size: Int64
-    var linkTarget: String?
-    var absolute: String
-}
-
 private struct StatInfo {
     var kind: String
     var mode: UInt32
     var mtimeNS: Int64
     var size: Int64
-}
-
-private final class SkipBox {
-    var paths: [String] = []
 }
 
 private final class ChunkAccum {
@@ -97,6 +83,75 @@ private func installDurable(_ encoded: Data, at url: URL, noun: String, names: i
     if parent != directory.path { names.insert(parent) }
 }
 
+/// Hashes created by one snapshot attempt. The names sit in a file so a large folder
+/// does not keep every new chunk id in memory. A crash leaves the file; the next attempt
+/// deletes it and does not treat those ids as chunks to remove.
+private final class HashList {
+    private let url: URL
+    private var handle: FileHandle?
+    private var buffer = Data()
+
+    init(url: URL) {
+        self.url = url
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    func append(_ hash: String) {
+        buffer.append(contentsOf: hash.utf8)
+        buffer.append(10)
+        if buffer.count >= 64 * 1024 { flush() }
+    }
+
+    /// Deletes each recorded hash, then the list.
+    func discard(_ remove: (String) -> Void) {
+        flush()
+        close()
+        guard let reader = FileHandle(forReadingAtPath: url.path) else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        defer {
+            try? reader.close()
+            try? FileManager.default.removeItem(at: url)
+        }
+        var pending = Data()
+        while true {
+            let piece = (try? reader.read(upToCount: 64 * 1024)) ?? Data()
+            if piece.isEmpty { break }
+            pending.append(piece)
+            while let newline = pending.firstIndex(of: 10) {
+                let line = pending[..<newline]
+                if !line.isEmpty {
+                    remove(String(decoding: line, as: UTF8.self))
+                }
+                pending.removeSubrange(..<pending.index(after: newline))
+            }
+        }
+    }
+
+    /// The attempt was published. Drop the list and leave the chunks.
+    func forget() {
+        flush()
+        close()
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func flush() {
+        guard !buffer.isEmpty else { return }
+        if handle == nil {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            handle = try? FileHandle(forWritingTo: url)
+        }
+        try? handle?.write(contentsOf: buffer)
+        buffer.removeAll(keepingCapacity: true)
+    }
+
+    private func close() {
+        try? handle?.close()
+        handle = nil
+    }
+}
+
 /// True when the path is a regular file larger than a stored chunk or directory record can be.
 private func regularFileIsLargerThan(_ url: URL, _ limit: Int) -> Bool {
     let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
@@ -106,27 +161,25 @@ private func regularFileIsLargerThan(_ url: URL, _ limit: Int) -> Bool {
 
 private final class ChunkStore {
     let root: URL
-    private var known = Set<String>()
     private var pendingNames = Set<String>()
-    private(set) var created: [String] = []
+    private let createdList: HashList
 
     init(root: URL) {
         self.root = root
+        createdList = HashList(url: root.appendingPathComponent(".new-chunks"))
     }
 
     func put(_ data: Data) throws -> (hash: String, isNew: Bool) {
         let hash = Digest.sha256(data)
-        if known.contains(hash) { return (hash, false) }
         let url = chunkURL(hash)
         // The bytes were just hashed. Reading the stored file back, to decompress
         // and hash it again, doubles a re-read. Verify History is that check.
         // A missing file is written. A file that is already there is reused as it is.
+        // The id is not remembered: a large folder would keep millions of them.
         if FileManager.default.fileExists(atPath: url.path) {
-            known.insert(hash)
             return (hash, false)
         }
         try store(ChunkCodec.encode(data), at: url, hash: hash, track: true)
-        known.insert(hash)
         return (hash, true)
     }
 
@@ -159,7 +212,7 @@ private final class ChunkStore {
 
     private func store(_ encoded: Data, at url: URL, hash: String, track: Bool) throws {
         try installDurable(encoded, at: url, noun: "a chunk", names: &pendingNames)
-        if track { created.append(hash) }
+        if track { createdList.append(hash) }
     }
 
     /// `unread` is a failed read. The file stays. `damaged` means the bytes were read
@@ -199,10 +252,14 @@ private final class ChunkStore {
     }
 
     func discardNew() {
-        for hash in created {
-            try? FileManager.default.removeItem(at: chunkURL(hash))
+        let root = self.root
+        createdList.discard { hash in
+            try? FileManager.default.removeItem(at: root.appendingPathComponent("chunks").appendingPathComponent(String(hash.prefix(2))).appendingPathComponent(hash))
         }
-        created.removeAll()
+    }
+
+    func keepNew() {
+        createdList.forget()
     }
 
     private func chunkURL(_ hash: String) -> URL {
@@ -214,14 +271,14 @@ private final class ChunkStore {
 /// A directory listing, named by the SHA-256 of its canonical JSON and stored like a chunk.
 private final class TreeStore {
     let root: URL
-    private var known = Set<String>()
     private var pendingNames = Set<String>()
-    private(set) var created: [String] = []
+    private let createdList: HashList
     /// A directory of 10,000 names is about 2 MB of JSON. Leave room above the chunk cap.
     static let maxBytes = 32 * 1024 * 1024
 
     init(root: URL) {
         self.root = root
+        createdList = HashList(url: root.appendingPathComponent(".new-trees"))
     }
 
     func put(_ data: Data) throws -> (hash: String, isNew: Bool) {
@@ -231,49 +288,59 @@ private final class TreeStore {
             throw ChronicleError.fail("A directory record is larger than Chronicle allows.")
         }
         let hash = Digest.sha256(data)
-        if known.contains(hash) { return (hash, false) }
-        let url = fileURL(hash)
+        let url = Self.fileURL(root, hash)
         let exists = FileManager.default.fileExists(atPath: url.path)
         if exists && check(hash) == "ok" {
-            known.insert(hash)
             return (hash, false)
         }
         try store(ChunkCodec.encode(data), at: url, hash: hash, track: !exists)
-        known.insert(hash)
         return (hash, !exists)
     }
 
     func check(_ hash: String) -> String {
-        let url = fileURL(hash)
-        if !FileManager.default.fileExists(atPath: url.path) { return "missing" }
-        if regularFileIsLargerThan(url, 16 + TreeStore.maxBytes) { return "damaged" }
-        do {
-            _ = try read(hash)
-            return "ok"
-        } catch {
-            return "damaged"
-        }
+        Self.status(root, hash)
     }
 
     func read(_ hash: String) throws -> Data {
+        try Self.load(root, hash)
+    }
+
+    /// Reads one directory record. Does not open the rollback list.
+    static func load(_ root: URL, _ hash: String) throws -> Data {
         guard Digest.isHash(hash) else { throw ChronicleError.fail("A directory id is not a SHA-256.") }
-        let url = fileURL(hash)
+        let url = fileURL(root, hash)
         if regularFileIsLargerThan(url, 16 + TreeStore.maxBytes) {
             throw ChronicleError.fail("A directory record is larger than Chronicle allows.")
         }
         let raw = try Data(contentsOf: url)
-        let data = try ChunkCodec.decode(raw, max: TreeStore.maxBytes)
+        let data = try ChunkCodec.decode(raw, max: maxBytes)
         if Digest.sha256(data) != hash {
             throw ChronicleError.fail("Damaged directory record \(hash.prefix(12)).")
         }
         return data
     }
 
-    func discardNew() {
-        for hash in created {
-            try? FileManager.default.removeItem(at: fileURL(hash))
+    static func status(_ root: URL, _ hash: String) -> String {
+        let url = fileURL(root, hash)
+        if !FileManager.default.fileExists(atPath: url.path) { return "missing" }
+        if regularFileIsLargerThan(url, 16 + TreeStore.maxBytes) { return "damaged" }
+        do {
+            _ = try load(root, hash)
+            return "ok"
+        } catch {
+            return "damaged"
         }
-        created.removeAll()
+    }
+
+    func discardNew() {
+        let root = self.root
+        createdList.discard { hash in
+            try? FileManager.default.removeItem(at: root.appendingPathComponent("trees").appendingPathComponent(String(hash.prefix(2))).appendingPathComponent(hash))
+        }
+    }
+
+    func keepNew() {
+        createdList.forget()
     }
 
     func flushNames() throws {
@@ -290,10 +357,10 @@ private final class TreeStore {
 
     private func store(_ encoded: Data, at url: URL, hash: String, track: Bool) throws {
         try installDurable(encoded, at: url, noun: "a directory", names: &pendingNames)
-        if track { created.append(hash) }
+        if track { createdList.append(hash) }
     }
 
-    private func fileURL(_ hash: String) -> URL {
+    private static func fileURL(_ root: URL, _ hash: String) -> URL {
         let shard = String(hash.prefix(2))
         return root.appendingPathComponent("trees").appendingPathComponent(shard).appendingPathComponent(hash)
     }
@@ -340,6 +407,9 @@ enum Vault {
     static var fault: SnapshotFault?
     /// Self-test only. A directory record larger than this many bytes is refused. Nil uses the format limit.
     static var directoryRecordLimit: Int?
+    /// Self-test only. When set, `snapshot` fills `files` after the version is published.
+    /// Production leaves that list empty so a large folder is not expanded back into memory.
+    static var retainFilesForTest = false
 
     /// A launch scan. `changed` means a watch snapshot would keep a version.
     /// `settled` is false when a version was published while the folder was being read.
@@ -392,50 +462,45 @@ enum Vault {
             directoryRecordLimit = nil
         }
 
-        let parent = try newestBody(vault)
+        let parent = try newestParent(vault)
         try stopIfCancelled(isCancelled)
-        let walked = try collect(
+        let built = try FolderWalker.scan(
             source: sourceURL,
             vault: vault,
             skip: Set(config.skipNames),
-            progress: progress,
-            isCancelled: isCancelled
-        )
-        let built = try buildContents(
-            walked: walked,
             parent: parent,
-            skip: Set(config.skipNames),
             verify: verify,
-            policy: .store(store, config.chunk),
+            store: store,
+            trees: trees,
+            params: config.chunk,
             progress: progress,
             isCancelled: isCancelled
         )
 
         try stopIfCancelled(isCancelled)
+        let previous = try accessSets(parent, vault: vault, skip: Set(config.skipNames))
         guard Snapshot.shouldKeep(
             reason: reason,
             stats: built.stats,
-            parent: parent,
-            files: built.files,
-            skipped: built.skipped,
-            skip: Set(config.skipNames)
+            carried: built.carried,
+            unread: built.unread,
+            parentCarried: previous.carried,
+            parentUnread: previous.unread
         ) else { return nil }
 
-        try stopIfCancelled(isCancelled)
-        let rootTree = try writeTrees(built.files, store: trees)
         try stopIfCancelled(isCancelled)
         var snap = Snapshot(
             format: AppInfo.format,
             id: SnapshotID.make(),
-            parent: parent?.id,
+            parent: parent.id,
             created: TimeText.nowISO(),
             label: label,
             reason: reason,
             source: sourceURL.path,
-            files: built.files,
+            files: [],
             skipped: built.skipped,
             stats: built.stats,
-            tree: rootTree
+            tree: built.rootTree
         )
         let directory = vault.appendingPathComponent("snapshots")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -446,6 +511,9 @@ enum Vault {
         try trees.flushNames()
         try publishBody(snap, directory: directory)
         committed = true
+        // The version names these chunks. Drop the rollback list without deleting them.
+        store.keepNew()
+        trees.keepNew()
         try syncDurable(directory)
         do {
             try checkFault(.writingHead)
@@ -459,6 +527,9 @@ enum Vault {
         let thinned = (try? pruneUnlocked(vault, now: Date())) ?? .none
         snap.pruned = thinned.count
         snap.pruneDetail = thinned
+        if retainFilesForTest, let tree = snap.tree {
+            snap.files = try expandTree(vault, tree)
+        }
         return snap
     }
 
@@ -468,15 +539,17 @@ enum Vault {
             throw ChronicleError.fail("Choose a folder to watch.")
         }
         let baseline = try? listHeads(vault).first?.id
-        let parent = try newestBody(vault)
+        let parent = try newestParent(vault)
         let skip = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
-        let walked = try collect(source: sourceURL, vault: vault, skip: skip, progress: nil, isCancelled: nil)
-        let built = try buildContents(
-            walked: walked,
-            parent: parent,
+        let built = try FolderWalker.scan(
+            source: sourceURL,
+            vault: vault,
             skip: skip,
+            parent: parent,
             verify: false,
-            policy: .probe,
+            store: nil,
+            trees: nil,
+            params: .standard,
             progress: nil,
             isCancelled: nil
         )
@@ -484,14 +557,15 @@ enum Vault {
         if after != baseline {
             return Probe(changed: false, settled: false)
         }
+        let previous = try accessSets(parent, vault: vault, skip: skip)
         return Probe(
             changed: Snapshot.shouldKeep(
                 reason: "watch",
                 stats: built.stats,
-                parent: parent,
-                files: built.files,
-                skipped: built.skipped,
-                skip: skip
+                carried: built.carried,
+                unread: built.unread,
+                parentCarried: previous.carried,
+                parentUnread: previous.unread
             ),
             settled: true
         )
@@ -1138,11 +1212,6 @@ enum Vault {
         return String(name.dropLast(suffix.count))
     }
 
-    private enum ReadPolicy {
-        case store(ChunkStore, ChunkParams)
-        case probe
-    }
-
     private static func checkFault(_ point: SnapshotFault) throws {
         guard fault == point else { return }
         fault = nil
@@ -1485,7 +1554,7 @@ enum Vault {
     }
 
     /// Builds directory records from the leaves up. Identical contents keep one hash.
-    private static func writeTrees(_ files: [Entry], store: TreeStore) throws -> String {
+    private static func writeTrees(_ files: [Entry], store: TreeStore, root: String = "") throws -> String {
         var byParent: [String: [Entry]] = [:]
         var knownDirs = Set(files.filter { $0.kind == "dir" }.map(\.path))
         knownDirs.insert("")
@@ -1532,7 +1601,7 @@ enum Vault {
             let data = try JSONFile.encoder(pretty: false).encode(nodes)
             return try store.put(data).hash
         }
-        return try build("")
+        return try build(root)
     }
 
     private static func expandTree(_ vault: URL, _ root: String) throws -> [Entry] {
@@ -1551,8 +1620,7 @@ enum Vault {
             chain.insert(next.hash)
             let nodes: [TreeNode]
             do {
-                let data = try TreeStore(root: vault).read(next.hash)
-                nodes = try JSONDecoder().decode([TreeNode].self, from: data)
+                nodes = try readNodes(vault, next.hash)
             } catch {
                 throw ChronicleError.fail("A directory record is missing.")
             }
@@ -1589,7 +1657,6 @@ enum Vault {
     /// Reads a directory record and every record under it. A broken record is reported, not thrown.
     private static func walkTree(_ vault: URL, _ root: String) -> TreeWalk {
         var walk = TreeWalk()
-        let store = TreeStore(root: vault)
         var pending = [root]
         while let hash = pending.popLast() {
             if !Digest.isHash(hash) {
@@ -1599,10 +1666,9 @@ enum Vault {
             if !walk.trees.insert(hash).inserted { continue }
             let nodes: [TreeNode]
             do {
-                let data = try store.read(hash)
-                nodes = try JSONDecoder().decode([TreeNode].self, from: data)
+                nodes = try readNodes(vault, hash)
             } catch {
-                let kind = store.check(hash) == "missing" ? "missing-directory" : "damaged-directory"
+                let kind = TreeStore.status(vault, hash) == "missing" ? "missing-directory" : "damaged-directory"
                 walk.problems.append((hash, kind))
                 continue
             }
@@ -1666,172 +1732,846 @@ enum Vault {
         return true
     }
 
-    /// Keeps the previous copy when one exists. A path with no copy is left for the unread count.
-    private static func noteUnreadable(
-        _ item: WalkItem,
-        parentMap: [String: Entry],
-        files: inout [Entry],
-        skipped: inout [String],
-        stats: inout SnapshotStats
-    ) {
-        skipped.append(item.relative)
-        guard let old = parentMap[item.relative], old.kind == "file" || old.kind == "link" else { return }
-        files.append(old)
-        if old.kind == "file" {
-            stats.fileCount += 1
-            stats.logicalBytes += old.size
-            stats.reusedChunkBytes += old.size
-        } else {
-            stats.linkCount += 1
-        }
-        stats.carriedFiles += 1
+    /// One directory in memory at a time. A large folder must not keep every chunk id.
+    private struct FolderScan {
+        var rootTree: String
+        var skipped: [String]
+        var stats: SnapshotStats
+        var carried: Set<String>
+        var unread: Set<String>
     }
 
-    private static func buildContents(
-        walked: (items: [WalkItem], skipped: [String]),
-        parent: Snapshot?,
-        skip: Set<String>,
-        verify: Bool,
-        policy: ReadPolicy,
-        progress: ((String) -> Void)?,
-        isCancelled: (() -> Bool)?
-    ) throws -> (files: [Entry], skipped: [String], stats: SnapshotStats) {
-        let parentMap = entriesByPath(parent?.files ?? [])
-        var files: [Entry] = []
-        var skipped = walked.skipped
-        var stats = SnapshotStats()
-        let accum = ChunkAccum()
+    /// The previous version, without the expanded file list when it is stored as a tree.
+    private enum PriorHistory {
+        case none
+        case blank(id: String, skipped: [String])
+        case inline(id: String, files: [Entry], kids: [String: [String: Entry]], skipped: [String])
+        case tree(id: String, root: String, skipped: [String])
 
-        for item in walked.items {
-            try stopIfCancelled(isCancelled)
-            progress?(item.relative)
-            switch item.kind {
-            case "dir":
-                let entry = Entry(
-                    path: item.relative,
-                    kind: "dir",
-                    mode: item.mode,
-                    mtimeNS: item.mtimeNS,
-                    size: 0,
-                    chunks: [],
-                    lengths: [],
-                    target: nil
-                )
-                files.append(entry)
-                stats.dirCount += 1
-                classify(entry, parent: parentMap[item.relative], stats: &stats, newBytes: 0, reusedBytes: 0)
-            case "link":
-                let entry = Entry(
-                    path: item.relative,
-                    kind: "link",
-                    mode: item.mode,
-                    mtimeNS: item.mtimeNS,
-                    size: item.size,
-                    chunks: [],
-                    lengths: [],
-                    target: item.linkTarget ?? ""
-                )
-                files.append(entry)
-                stats.linkCount += 1
-                classify(entry, parent: parentMap[item.relative], stats: &stats, newBytes: 0, reusedBytes: 0)
-            case "file":
-                if !verify,
-                   let old = parentMap[item.relative],
-                   old.kind == "file",
-                   old.size == item.size,
-                   old.mtimeNS == item.mtimeNS {
-                    var kept = old
-                    kept.mode = item.mode
-                    files.append(kept)
-                    stats.fileCount += 1
-                    stats.logicalBytes += item.size
-                    stats.reusedChunkBytes += item.size
-                    if old.mode != item.mode {
-                        stats.changedFiles += 1
-                    } else {
-                        stats.unchangedFiles += 1
-                    }
-                    continue
-                }
-                // A file that cannot be opened is carried or unread, not added.
-                // The probe has to agree, or a folder Chronicle cannot read stays due forever.
-                if !canRead(item.absolute) {
-                    noteUnreadable(item, parentMap: parentMap, files: &files, skipped: &skipped, stats: &stats)
-                    continue
-                }
-                if case .probe = policy {
-                    files.append(Entry(
-                        path: item.relative,
-                        kind: "file",
-                        mode: item.mode,
-                        mtimeNS: item.mtimeNS,
-                        size: item.size,
-                        chunks: [],
-                        lengths: [],
-                        target: nil
-                    ))
-                    stats.fileCount += 1
-                    stats.logicalBytes += item.size
-                    if parentMap[item.relative] == nil {
-                        stats.addedFiles += 1
-                    } else {
-                        stats.changedFiles += 1
-                    }
-                    continue
-                }
-                guard case .store(let store, let params) = policy else { continue }
-                accum.reset()
-                do {
-                    try ingest(item.absolute, params: params, store: store, accum: accum, isCancelled: isCancelled)
-                } catch let error as ChronicleError {
-                    // The vault could not store the chunk. Saving the file as unreadable
-                    // would publish a version that does not have these bytes.
-                    throw error
-                } catch {
-                    noteUnreadable(item, parentMap: parentMap, files: &files, skipped: &skipped, stats: &stats)
-                    continue
-                }
-                let readSize = accum.lengths.reduce(0, +)
-                var mtime = item.mtimeNS
-                let size = Int64(readSize)
-                if let after = lstatInfo(item.absolute), after.kind == "file" {
-                    if after.size != Int64(readSize) || after.mtimeNS != item.mtimeNS {
-                        mtime = 0
-                    }
-                }
-                let entry = Entry(
-                    path: item.relative,
-                    kind: "file",
-                    mode: item.mode,
-                    mtimeNS: mtime,
-                    size: size,
-                    chunks: accum.chunks,
-                    lengths: accum.lengths,
-                    target: nil
-                )
-                files.append(entry)
-                stats.fileCount += 1
-                stats.logicalBytes += size
-                stats.newChunkBytes += accum.newBytes
-                stats.reusedChunkBytes += accum.reusedBytes
-                classify(entry, parent: parentMap[item.relative], stats: &stats, newBytes: accum.newBytes, reusedBytes: accum.reusedBytes)
-                try stopIfCancelled(isCancelled)
-            default:
-                skipped.append(item.relative)
+        var id: String? {
+            switch self {
+            case .none: return nil
+            case .blank(let id, _): return id
+            case .inline(let id, _, _, _): return id
+            case .tree(let id, _, _): return id
             }
         }
 
-        var seen = Set(files.map(\.path))
-        let trouble = skipped.filter { !RelPath.isExcluded($0, names: skip) }
+        var skipped: [String] {
+            switch self {
+            case .none: return []
+            case .blank(_, let skipped): return skipped
+            case .inline(_, _, _, let skipped): return skipped
+            case .tree(_, _, let skipped): return skipped
+            }
+        }
+    }
+
+    /// The newest version that can still be read. A damaged newest file is skipped.
+    /// A tree is checked one directory at a time, so the chunk ids are not collected.
+    private static func newestParent(_ vault: URL) throws -> PriorHistory {
+        for head in try listHeads(vault) {
+            guard let stored = try? readStored(vault, head.id) else { continue }
+            let inline = stored.files ?? []
+            if !inline.isEmpty {
+                return .inline(id: stored.id, files: inline, kids: indexEntries(inline), skipped: stored.skipped)
+            }
+            if let tree = stored.tree, !tree.isEmpty {
+                if treeIsReadable(vault, tree) {
+                    return .tree(id: stored.id, root: tree, skipped: stored.skipped)
+                }
+                continue
+            }
+            return .blank(id: stored.id, skipped: stored.skipped)
+        }
+        return .none
+    }
+
+    private static func indexEntries(_ files: [Entry]) -> [String: [String: Entry]] {
+        var kids: [String: [String: Entry]] = [:]
+        for entry in files {
+            let parent = parentPath(entry.path)
+            let name = leafName(entry.path)
+            if kids[parent] == nil { kids[parent] = [:] }
+            if kids[parent]![name] == nil {
+                kids[parent]![name] = entry
+            }
+        }
+        return kids
+    }
+
+    /// True when every directory record can be read. Shared hashes are read again.
+    /// The chunk ids inside those records are not kept.
+    private static func treeIsReadable(_ vault: URL, _ root: String) -> Bool {
+        if !Digest.isHash(root) { return false }
+        var pending: [(hash: String, chain: Set<String>)] = [(root, [])]
+        while let next = pending.popLast() {
+            if next.chain.contains(next.hash) { return false }
+            let nodes: [TreeNode]
+            do {
+                nodes = try readNodes(vault, next.hash)
+            } catch {
+                return false
+            }
+            var chain = next.chain
+            chain.insert(next.hash)
+            for node in nodes {
+                if node.name.isEmpty || node.name == "." || node.name == ".." || node.name.contains("/") {
+                    return false
+                }
+                if node.kind == "dir" {
+                    guard let child = node.tree, Digest.isHash(child) else { return false }
+                    pending.append((child, chain))
+                }
+            }
+        }
+        return true
+    }
+
+    private static func readNodes(_ vault: URL, _ hash: String) throws -> [TreeNode] {
+        let data: Data
+        do {
+            data = try TreeStore.load(vault, hash)
+        } catch {
+            throw ChronicleError.fail("A directory record is missing.")
+        }
+        do {
+            return try JSONDecoder().decode([TreeNode].self, from: data)
+        } catch {
+            throw ChronicleError.fail("A directory record is missing.")
+        }
+    }
+
+    private static func nodeExists(_ vault: URL, _ root: String, _ path: String) throws -> Bool {
+        var hash = root
+        let parts = path.split(separator: "/").map(String.init)
+        if parts.isEmpty { return false }
+        for (index, part) in parts.enumerated() {
+            let nodes = try readNodes(vault, hash)
+            guard let node = nodes.first(where: { $0.name == part }) else { return false }
+            if index == parts.count - 1 { return true }
+            guard node.kind == "dir", let child = node.tree else { return false }
+            hash = child
+        }
+        return false
+    }
+
+    private static func accessSets(
+        _ parent: PriorHistory,
+        vault: URL,
+        skip: Set<String>
+    ) throws -> (carried: Set<String>, unread: Set<String>) {
+        switch parent {
+        case .none:
+            return ([], [])
+        case .inline(_, let files, _, let skipped):
+            return Snapshot.access(files: files, skipped: skipped, skip: skip)
+        case .blank(_, let skipped):
+            var unread = Set<String>()
+            for path in skipped where !RelPath.isExcluded(path, names: skip) {
+                unread.insert(path)
+            }
+            return ([], unread)
+        case .tree(_, let root, let skipped):
+            var carried = Set<String>()
+            var unread = Set<String>()
+            for path in skipped {
+                if RelPath.isExcluded(path, names: skip) { continue }
+                if try nodeExists(vault, root, path) {
+                    carried.insert(path)
+                } else {
+                    unread.insert(path)
+                }
+            }
+            return (carried, unread)
+        }
+    }
+
+    /// The file list for a tree-format version. Inline versions still expand.
+    static func listVersion(_ vault: URL, _ id: String) throws -> VersionBrowse {
+        let stored = try readStored(vault, id)
+        let inline = stored.files ?? []
+        if !inline.isEmpty || stored.tree == nil || stored.tree?.isEmpty == true {
+            return try browseExpanded(vault, id)
+        }
+        switch try browseParent(vault, of: stored) {
+        case .inline:
+            return try browseExpanded(vault, id)
+        case .absent(let comparable):
+            return try browseTrees(
+                vault: vault,
+                current: stored.tree ?? "",
+                parent: nil,
+                comparable: comparable,
+                skipped: stored.skipped
+            )
+        case .tree(let hash):
+            return try browseTrees(
+                vault: vault,
+                current: stored.tree ?? "",
+                parent: hash,
+                comparable: true,
+                skipped: stored.skipped
+            )
+        }
+    }
+
+    private enum BrowseParent {
+        case absent(comparable: Bool)
+        case inline
+        case tree(String)
+    }
+
+    private static func browseParent(_ vault: URL, of stored: StoredSnapshot) throws -> BrowseParent {
+        guard let parentID = stored.parent else { return .absent(comparable: true) }
+        if let match = try storedParent(vault, parentID) { return match }
+        let older = ((try? snapshotIDs(vault)) ?? []).filter { $0 < stored.id }.sorted()
+        for id in older.reversed() {
+            if let match = try storedParent(vault, id) { return match }
+        }
+        return .absent(comparable: false)
+    }
+
+    private static func storedParent(_ vault: URL, _ id: String) throws -> BrowseParent? {
+        guard let stored = try? readStored(vault, id) else { return nil }
+        if let files = stored.files, !files.isEmpty { return .inline }
+        if let tree = stored.tree, !tree.isEmpty, treeIsReadable(vault, tree) { return .tree(tree) }
+        if (stored.files ?? []).isEmpty && (stored.tree ?? "").isEmpty { return .absent(comparable: true) }
+        return nil
+    }
+
+    private static func browseExpanded(_ vault: URL, _ id: String) throws -> VersionBrowse {
+        let snap = try load(vault, id)
+        let basis = compared(vault: vault, to: snap)
+        let names = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
+        let warnings = snap.warnings(skipNames: names)
+        let rows = Diff.rows(
+            current: snap.files,
+            parent: basis.parent?.files,
+            comparable: basis.comparable,
+            carried: warnings.carried,
+            unread: warnings.unread
+        )
+        let folders = snap.files.compactMap { $0.kind == "dir" ? $0.path : nil }.sorted()
+        return VersionBrowse(rows: rows, folders: folders)
+    }
+
+    private static func browseTrees(
+        vault: URL,
+        current: String,
+        parent: String?,
+        comparable: Bool,
+        skipped: [String]
+    ) throws -> VersionBrowse {
+        let skip = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
+        var carried = Set<String>()
+        var unread: [String] = []
+        for path in skipped {
+            if RelPath.isExcluded(path, names: skip) { continue }
+            if try nodeExists(vault, current, path) {
+                carried.insert(path)
+            } else {
+                unread.append(path)
+            }
+        }
+        var rows: [BrowserRow] = []
+        var folders: [String] = []
+        var seen = Set<String>()
+        _ = try browseDirectory(
+            vault: vault,
+            current: current,
+            parent: comparable ? parent : nil,
+            prefix: "",
+            comparable: comparable,
+            carried: carried,
+            chain: [],
+            rows: &rows,
+            folders: &folders,
+            seen: &seen
+        )
+        for path in unread where seen.insert(path).inserted {
+            rows.append(BrowserRow(path: path, kind: "file", change: "unread", size: 0, newBytes: 0, chunkCount: 0))
+        }
+        rows.sort { $0.path < $1.path }
+        folders.sort()
+        return VersionBrowse(rows: rows, folders: folders)
+    }
+
+    /// One directory against its parent. Returns whether this directory holds a file or link.
+    private static func browseDirectory(
+        vault: URL,
+        current: String,
+        parent: String?,
+        prefix: String,
+        comparable: Bool,
+        carried: Set<String>,
+        chain: Set<String>,
+        rows: inout [BrowserRow],
+        folders: inout [String],
+        seen: inout Set<String>
+    ) throws -> Bool {
+        if chain.contains(current) {
+            throw ChronicleError.fail("A directory record repeats itself.")
+        }
+        var chain = chain
+        chain.insert(current)
+        let nodes = try readNodes(vault, current)
+        var parentNodes: [String: TreeNode] = [:]
         if let parent {
-            for old in parent.files where !seen.contains(old.path) && trouble.contains(where: { old.path == $0 || old.path.hasPrefix($0 + "/") }) {
-                files.append(old)
-                seen.insert(old.path)
-                switch old.kind {
+            for node in try readNodes(vault, parent) where parentNodes[node.name] == nil {
+                parentNodes[node.name] = node
+            }
+        }
+        var hasFiles = false
+        var names = Set<String>()
+        for node in nodes {
+            if !names.insert(node.name).inserted { continue }
+            let path = prefix.isEmpty ? node.name : prefix + "/" + node.name
+            guard RelPath.isSafe(path) else {
+                throw ChronicleError.fail("Refusing a path that leaves the folder.")
+            }
+            let old = comparable ? parentNodes[node.name] : nil
+            if node.kind == "dir" {
+                folders.append(path)
+                let childHas = try browseDirectory(
+                    vault: vault,
+                    current: node.tree ?? "",
+                    parent: old?.kind == "dir" ? old?.tree : nil,
+                    prefix: path,
+                    comparable: comparable,
+                    carried: carried,
+                    chain: chain,
+                    rows: &rows,
+                    folders: &folders,
+                    seen: &seen
+                )
+                if childHas { hasFiles = true }
+                if !seen.insert(path).inserted { continue }
+                let change = directoryChange(path: path, node: node, old: old, comparable: comparable, carried: carried, hasFiles: childHas)
+                if let change {
+                    rows.append(BrowserRow(path: path, kind: "dir", change: change, size: 0, newBytes: 0, chunkCount: 0))
+                } else {
+                    seen.remove(path)
+                }
+                continue
+            }
+            if node.kind == "file" || node.kind == "link" { hasFiles = true }
+            if !seen.insert(path).inserted { continue }
+            rows.append(fileRow(path: path, node: node, old: old, comparable: comparable, carried: carried))
+        }
+        if comparable {
+            var removed = Set<String>()
+            for (name, node) in parentNodes where !names.contains(name) {
+                if !removed.insert(name).inserted { continue }
+                let path = prefix.isEmpty ? name : prefix + "/" + name
+                if seen.contains(path) { continue }
+                try appendRemoved(vault: vault, node: node, path: path, chain: chain, rows: &rows, seen: &seen)
+            }
+        }
+        return hasFiles
+    }
+
+    private static func directoryChange(
+        path: String,
+        node: TreeNode,
+        old: TreeNode?,
+        comparable: Bool,
+        carried: Set<String>,
+        hasFiles: Bool
+    ) -> String? {
+        if carried.contains(path) && !hasFiles { return "carried" }
+        if !comparable { return nil }
+        guard let old else { return "added" }
+        if old.kind != "dir" || old.mode != node.mode { return "changed" }
+        return nil
+    }
+
+    private static func fileRow(
+        path: String,
+        node: TreeNode,
+        old: TreeNode?,
+        comparable: Bool,
+        carried: Set<String>
+    ) -> BrowserRow {
+        let chunks = node.chunks ?? []
+        let lengths = node.lengths ?? []
+        var change = "same"
+        if carried.contains(path) || hasCarriedAncestor(path, carried) {
+            change = "carried"
+        } else if comparable {
+            if old == nil {
+                change = "added"
+            } else if old?.kind != node.kind || (old?.chunks ?? []) != chunks || (old?.target ?? "") != (node.target ?? "") || (old?.size ?? 0) != (node.size ?? 0) || old?.mode != node.mode {
+                change = "changed"
+            }
+        }
+        var fresh: Int64 = 0
+        if comparable {
+            if let old {
+                let have = Set(old.chunks ?? [])
+                for (hash, length) in zip(chunks, lengths) where !have.contains(hash) {
+                    fresh += Int64(length)
+                }
+            } else {
+                fresh = lengths.reduce(Int64(0)) { $0 + Int64($1) }
+            }
+        }
+        return BrowserRow(
+            path: path,
+            kind: node.kind,
+            change: change,
+            size: node.size ?? 0,
+            newBytes: fresh,
+            chunkCount: chunks.count
+        )
+    }
+
+    private static func hasCarriedAncestor(_ path: String, _ carried: Set<String>) -> Bool {
+        var path = path
+        while let slash = path.lastIndex(of: "/") {
+            path = String(path[..<slash])
+            if carried.contains(path) { return true }
+        }
+        return false
+    }
+
+    private static func appendRemoved(
+        vault: URL,
+        node: TreeNode,
+        path: String,
+        chain: Set<String>,
+        rows: inout [BrowserRow],
+        seen: inout Set<String>
+    ) throws {
+        var pending: [(TreeNode, String, Set<String>)] = [(node, path, chain)]
+        while let next = pending.popLast() {
+            if !seen.insert(next.1).inserted { continue }
+            let item = next.0
+            rows.append(BrowserRow(
+                path: next.1,
+                kind: item.kind,
+                change: "removed",
+                size: item.kind == "dir" ? 0 : (item.size ?? 0),
+                newBytes: 0,
+                chunkCount: item.chunks?.count ?? 0
+            ))
+            guard item.kind == "dir", let hash = item.tree else { continue }
+            if next.2.contains(hash) {
+                throw ChronicleError.fail("A directory record repeats itself.")
+            }
+            var chain = next.2
+            chain.insert(hash)
+            for child in try readNodes(vault, hash) {
+                let childPath = next.1.isEmpty ? child.name : next.1 + "/" + child.name
+                pending.append((child, childPath, chain))
+            }
+        }
+    }
+
+    /// Walks the source one directory at a time and writes that directory's record before forgetting it.
+    private final class FolderWalker {
+        let vault: URL
+        let vaultPath: String
+        let skip: Set<String>
+        let history: PriorHistory
+        let verify: Bool
+        let store: ChunkStore?
+        let trees: TreeStore?
+        let params: ChunkParams
+        let progress: ((String) -> Void)?
+        let isCancelled: (() -> Bool)?
+        var stats = SnapshotStats()
+        var ledger = SkipLedger()
+        let accum = ChunkAccum()
+
+        struct Prior {
+            var kind: String
+            var mode: UInt32
+            var mtimeNS: Int64
+            var size: Int64
+            var chunks: [String]
+            var lengths: [Int]
+            var target: String?
+            var tree: String?
+
+            static func from(node: TreeNode) -> Prior {
+                Prior(
+                    kind: node.kind, mode: node.mode, mtimeNS: node.mtimeNS, size: node.size ?? 0,
+                    chunks: node.chunks ?? [], lengths: node.lengths ?? [], target: node.target, tree: node.tree
+                )
+            }
+
+            static func from(entry: Entry) -> Prior {
+                Prior(
+                    kind: entry.kind, mode: entry.mode, mtimeNS: entry.mtimeNS, size: entry.size,
+                    chunks: entry.chunks, lengths: entry.lengths, target: entry.target, tree: nil
+                )
+            }
+        }
+
+        final class DirBuild {
+            var nodes: [TreeNode] = []
+            var names = Set<String>()
+        }
+
+        struct SkipLedger {
+            private(set) var warnings: [String] = []
+            private(set) var routines: [String] = []
+            private(set) var total = 0
+            private var exact = Set<String>()
+            private var covered = Set<String>()
+
+            mutating func add(_ path: String, routine: Bool) {
+                total += 1
+                if routine {
+                    if routines.count < 200 { routines.append(path) }
+                } else if warnings.count < 200 {
+                    warnings.append(path)
+                }
+            }
+
+            mutating func noteExact(_ path: String) {
+                if warnings.contains(path) {
+                    exact.insert(path)
+                    covered.insert(path)
+                }
+            }
+
+            mutating func noteCovered(_ path: String) {
+                if warnings.contains(path) { covered.insert(path) }
+            }
+
+            func storedList() -> [String] {
+                var list = warnings
+                if list.count < 200 {
+                    list.append(contentsOf: routines.prefix(200 - list.count))
+                }
+                return list
+            }
+
+            func access() -> (carried: Set<String>, unread: Set<String>) {
+                var carried = Set<String>()
+                var unread = Set<String>()
+                for path in warnings {
+                    if exact.contains(path) {
+                        carried.insert(path)
+                    } else if !covered.contains(path) {
+                        unread.insert(path)
+                    }
+                }
+                return (carried, unread)
+            }
+        }
+
+        static func scan(
+            source: URL,
+            vault: URL,
+            skip: Set<String>,
+            parent: PriorHistory,
+            verify: Bool,
+            store: ChunkStore?,
+            trees: TreeStore?,
+            params: ChunkParams,
+            progress: ((String) -> Void)?,
+            isCancelled: (() -> Bool)?
+        ) throws -> FolderScan {
+            let walker = FolderWalker(
+                vault: vault,
+                vaultPath: vault.resolvingSymlinksInPath().path,
+                skip: skip,
+                history: parent,
+                verify: verify,
+                store: store,
+                trees: trees,
+                params: params,
+                progress: progress,
+                isCancelled: isCancelled
+            )
+            let names: [String]
+            do {
+                names = try FileManager.default.contentsOfDirectory(atPath: source.path).sorted()
+            } catch {
+                throw ChronicleError.fail("Could not read \(source.path).")
+            }
+            let rootHash: String?
+            if case .tree(_, let root, _) = parent { rootHash = root } else { rootHash = nil }
+            let tree = try walker.walk(relative: "", absolute: source.path, names: names, parentHash: rootHash)
+            let access = walker.ledger.access()
+            walker.stats.skippedCount = walker.ledger.total
+            return FolderScan(
+                rootTree: tree,
+                skipped: walker.ledger.storedList(),
+                stats: walker.stats,
+                carried: access.carried,
+                unread: access.unread
+            )
+        }
+
+        init(
+            vault: URL,
+            vaultPath: String,
+            skip: Set<String>,
+            history: PriorHistory,
+            verify: Bool,
+            store: ChunkStore?,
+            trees: TreeStore?,
+            params: ChunkParams,
+            progress: ((String) -> Void)?,
+            isCancelled: (() -> Bool)?
+        ) {
+            self.vault = vault
+            self.vaultPath = vaultPath
+            self.skip = skip
+            self.history = history
+            self.verify = verify
+            self.store = store
+            self.trees = trees
+            self.params = params
+            self.progress = progress
+            self.isCancelled = isCancelled
+        }
+
+        func walk(relative: String, absolute: String, names: [String], parentHash: String?) throws -> String {
+            let prior = try loadPrior(relative: relative, parentHash: parentHash)
+            let build = DirBuild()
+            for name in names {
+                try autoreleasepool {
+                    try self.consume(
+                        name: name,
+                        parentRelative: relative,
+                        parentAbsolute: absolute,
+                        prior: prior,
+                        build: build
+                    )
+                }
+            }
+            for (name, old) in prior where !build.names.contains(name) {
+                stats.removedFiles += 1
+                let path = join(relative, name)
+                if old.kind == "dir" {
+                    stats.removedFiles += try descendantCount(old, path)
+                }
+            }
+            return try commit(build.nodes)
+        }
+
+        func consume(
+            name: String,
+            parentRelative: String,
+            parentAbsolute: String,
+            prior: [String: Prior],
+            build: DirBuild
+        ) throws {
+            let relative = join(parentRelative, name)
+            let absolute = parentAbsolute == "/" ? "/" + name : parentAbsolute + "/" + name
+            let old = prior[name]
+            try Vault.stopIfCancelled(isCancelled)
+            guard let info = Vault.lstatInfo(absolute) else {
+                if let old, !RelPath.isExcluded(relative, names: skip) {
+                    try adopt(name: name, relative: relative, prior: old, build: build)
+                } else {
+                    noteSkip(relative, stored: false, covered: false)
+                }
+                return
+            }
+            if skip.contains(name) || absolute == vaultPath || absolute.hasPrefix(vaultPath + "/") {
+                noteSkip(relative, stored: false, covered: false)
+                return
+            }
+            progress?(relative)
+            try Vault.stopIfCancelled(isCancelled)
+            switch info.kind {
+            case "dir":
+                let listed: [String]
+                do {
+                    listed = try FileManager.default.contentsOfDirectory(atPath: absolute).sorted()
+                } catch {
+                    try seal(name: name, relative: relative, info: info, prior: old, build: build)
+                    return
+                }
+                let childHash = old?.kind == "dir" ? old?.tree : nil
+                let tree = try walk(relative: relative, absolute: absolute, names: listed, parentHash: childHash)
+                appendDir(name: name, info: info, tree: tree, build: build)
+                stats.dirCount += 1
+                classify(kind: "dir", mode: info.mode, size: 0, chunks: [], target: nil, prior: old)
+                build.names.insert(name)
+            case "link":
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: absolute)) ?? ""
+                appendLink(name: name, info: info, target: target, build: build)
+                stats.linkCount += 1
+                classify(kind: "link", mode: info.mode, size: info.size, chunks: [], target: target, prior: old)
+                build.names.insert(name)
+            case "file":
+                try takeFile(name: name, relative: relative, absolute: absolute, info: info, prior: old, build: build)
+            default:
+                if let old {
+                    try adopt(name: name, relative: relative, prior: old, build: build)
+                } else {
+                    noteSkip(relative, stored: false, covered: false)
+                }
+            }
+        }
+
+        func takeFile(
+            name: String,
+            relative: String,
+            absolute: String,
+            info: StatInfo,
+            prior: Prior?,
+            build: DirBuild
+        ) throws {
+            if !verify,
+               let prior,
+               prior.kind == "file",
+               prior.size == info.size,
+               prior.mtimeNS == info.mtimeNS {
+                appendFile(name: name, mode: info.mode, mtime: prior.mtimeNS, size: prior.size, chunks: prior.chunks, lengths: prior.lengths, build: build)
+                stats.fileCount += 1
+                stats.logicalBytes += info.size
+                stats.reusedChunkBytes += info.size
+                if prior.mode != info.mode { stats.changedFiles += 1 } else { stats.unchangedFiles += 1 }
+                build.names.insert(name)
+                return
+            }
+            if !Vault.canRead(absolute) {
+                if let prior {
+                    try adopt(name: name, relative: relative, prior: prior, build: build)
+                } else {
+                    noteSkip(relative, stored: false, covered: false)
+                }
+                return
+            }
+            guard let store else {
+                stats.fileCount += 1
+                stats.logicalBytes += info.size
+                if prior == nil { stats.addedFiles += 1 } else { stats.changedFiles += 1 }
+                build.names.insert(name)
+                return
+            }
+            accum.reset()
+            do {
+                try Vault.ingest(absolute, params: params, store: store, accum: accum, isCancelled: isCancelled)
+            } catch let error as ChronicleError {
+                throw error
+            } catch {
+                if let prior {
+                    try adopt(name: name, relative: relative, prior: prior, build: build)
+                } else {
+                    noteSkip(relative, stored: false, covered: false)
+                }
+                return
+            }
+            let readSize = accum.lengths.reduce(0, +)
+            var mtime = info.mtimeNS
+            let size = Int64(readSize)
+            if let after = Vault.lstatInfo(absolute), after.kind == "file" {
+                if after.size != Int64(readSize) || after.mtimeNS != info.mtimeNS {
+                    mtime = 0
+                }
+            }
+            let chunks = accum.chunks
+            let lengths = accum.lengths
+            appendFile(name: name, mode: info.mode, mtime: mtime, size: size, chunks: chunks, lengths: lengths, build: build)
+            stats.fileCount += 1
+            stats.logicalBytes += size
+            stats.newChunkBytes += accum.newBytes
+            stats.reusedChunkBytes += accum.reusedBytes
+            classify(kind: "file", mode: info.mode, size: size, chunks: chunks, target: nil, prior: prior)
+            build.names.insert(name)
+            try Vault.stopIfCancelled(isCancelled)
+        }
+
+        /// The folder could not be listed. Keep its previous contents and the current mode.
+        func seal(name: String, relative: String, info: StatInfo, prior: Prior?, build: DirBuild) throws {
+            let child: String
+            if let prior, prior.kind == "dir" {
+                child = try reusedHash(prior, relative)
+                try countCarried(prior, relative)
+            } else {
+                child = try emptyHash()
+            }
+            appendDir(name: name, info: info, tree: child, build: build)
+            stats.dirCount += 1
+            classify(kind: "dir", mode: info.mode, size: 0, chunks: [], target: nil, prior: prior)
+            build.names.insert(name)
+            noteSkip(relative, stored: true, covered: false)
+        }
+
+        /// A path that could not be read keeps the previous record when there is one.
+        func adopt(name: String, relative: String, prior: Prior, build: DirBuild) throws {
+            switch prior.kind {
+            case "file":
+                appendFile(name: name, mode: prior.mode, mtime: prior.mtimeNS, size: prior.size, chunks: prior.chunks, lengths: prior.lengths, build: build)
+                stats.fileCount += 1
+                stats.logicalBytes += prior.size
+                stats.reusedChunkBytes += prior.size
+                stats.carriedFiles += 1
+            case "link":
+                appendLink(name: name, info: StatInfo(kind: "link", mode: prior.mode, mtimeNS: prior.mtimeNS, size: prior.size), target: prior.target ?? "", build: build)
+                stats.linkCount += 1
+                stats.carriedFiles += 1
+            case "dir":
+                let tree = try reusedHash(prior, relative)
+                appendDir(
+                    name: name,
+                    info: StatInfo(kind: "dir", mode: prior.mode, mtimeNS: prior.mtimeNS, size: 0),
+                    tree: tree,
+                    build: build
+                )
+                stats.dirCount += 1
+                try countCarried(prior, relative)
+            default:
+                noteSkip(relative, stored: false, covered: false)
+                return
+            }
+            build.names.insert(name)
+            noteSkip(relative, stored: true, covered: false)
+        }
+
+        func reusedHash(_ prior: Prior, _ relative: String) throws -> String {
+            if let hash = prior.tree, !hash.isEmpty { return hash }
+            guard let trees else { return "" }
+            if case .inline(_, let files, _, _) = history {
+                return try Vault.writeTrees(files, store: trees, root: relative)
+            }
+            return try emptyHash()
+        }
+
+        func emptyHash() throws -> String {
+            guard let trees else { return "" }
+            let data = try JSONFile.encoder(pretty: false).encode([TreeNode]())
+            return try trees.put(data).hash
+        }
+
+        func countCarried(_ prior: Prior, _ relative: String) throws {
+            if let hash = prior.tree, !hash.isEmpty {
+                try visit(hash) { node in
+                    switch node.kind {
+                    case "file":
+                        self.stats.fileCount += 1
+                        self.stats.logicalBytes += node.size ?? 0
+                        self.stats.reusedChunkBytes += node.size ?? 0
+                        self.stats.carriedFiles += 1
+                    case "link":
+                        self.stats.linkCount += 1
+                        self.stats.carriedFiles += 1
+                    case "dir":
+                        self.stats.dirCount += 1
+                    default:
+                        break
+                    }
+                }
+                return
+            }
+            guard case .inline(_, let files, _, _) = history else { return }
+            var seen = Set<String>()
+            for entry in files where entry.path.hasPrefix(relative + "/") {
+                if !seen.insert(entry.path).inserted { continue }
+                switch entry.kind {
                 case "file":
                     stats.fileCount += 1
-                    stats.logicalBytes += old.size
-                    stats.reusedChunkBytes += old.size
+                    stats.logicalBytes += entry.size
+                    stats.reusedChunkBytes += entry.size
                     stats.carriedFiles += 1
                 case "link":
                     stats.linkCount += 1
@@ -1843,45 +2583,125 @@ enum Vault {
                 }
             }
         }
-        for path in trouble {
-            if seen.contains(path) { continue }
-            if files.contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) { continue }
-            stats.unreadFiles += 1
+
+        func descendantCount(_ prior: Prior, _ relative: String) throws -> Int {
+            if let hash = prior.tree, !hash.isEmpty {
+                var count = 0
+                try visit(hash) { _ in count += 1 }
+                return count
+            }
+            guard case .inline(_, let files, _, _) = history else { return 0 }
+            var seen = Set<String>()
+            for entry in files where entry.path.hasPrefix(relative + "/") {
+                if entry.kind == "file" || entry.kind == "link" || entry.kind == "dir" {
+                    if seen.insert(entry.path).inserted { }
+                }
+            }
+            return seen.count
         }
-        var removedPaths = Set<String>()
-        for old in parent?.files ?? [] where !seen.contains(old.path) && (old.kind == "file" || old.kind == "link" || old.kind == "dir") {
-            if removedPaths.insert(old.path).inserted {
-                stats.removedFiles += 1
+
+        func visit(_ hash: String, _ body: (TreeNode) throws -> Void) throws {
+            var pending: [(String, Set<String>)] = [(hash, [])]
+            while let next = pending.popLast() {
+                if next.1.contains(next.0) {
+                    throw ChronicleError.fail("A directory record repeats itself.")
+                }
+                let nodes = try Vault.readNodes(vault, next.0)
+                var chain = next.1
+                chain.insert(next.0)
+                for node in nodes {
+                    try body(node)
+                    if node.kind == "dir", let child = node.tree {
+                        pending.append((child, chain))
+                    }
+                }
             }
         }
-        stats.skippedCount = skipped.count
-        var warnings = skipped.filter { !RelPath.isExcluded($0, names: skip) }
-        let routine = skipped.filter { RelPath.isExcluded($0, names: skip) }
-        warnings.append(contentsOf: routine)
-        skipped = warnings.count > 200 ? Array(warnings.prefix(200)) : warnings
-        files.sort { $0.path < $1.path }
-        return (files, skipped, stats)
-    }
 
-    /// The newest version whose file still loads. A damaged newest file must not block the next snapshot.
-    private static func newestBody(_ vault: URL) throws -> Snapshot? {
-        for head in try listHeads(vault) {
-            if let snap = try? load(vault, head.id) {
-                return snap
+        func classify(kind: String, mode: UInt32, size: Int64, chunks: [String], target: String?, prior: Prior?) {
+            guard let prior else {
+                stats.addedFiles += 1
+                return
+            }
+            let changed: Bool
+            switch kind {
+            case "dir":
+                changed = prior.kind != "dir" || prior.mode != mode
+            case "link":
+                changed = prior.kind != "link" || (prior.target ?? "") != (target ?? "") || prior.size != size || prior.mode != mode
+            default:
+                changed = prior.kind != "file" || prior.chunks != chunks || prior.size != size || prior.mode != mode || prior.target != nil
+            }
+            if changed { stats.changedFiles += 1 } else { stats.unchangedFiles += 1 }
+        }
+
+        func noteSkip(_ path: String, stored: Bool, covered: Bool) {
+            let routine = RelPath.isExcluded(path, names: skip)
+            ledger.add(path, routine: routine)
+            if stored {
+                ledger.noteExact(path)
+            } else if covered {
+                ledger.noteCovered(path)
+            } else if !routine {
+                stats.unreadFiles += 1
             }
         }
-        return nil
+
+        func appendFile(name: String, mode: UInt32, mtime: Int64, size: Int64, chunks: [String], lengths: [Int], build: DirBuild) {
+            guard trees != nil else { return }
+            build.nodes.append(TreeNode(
+                name: name, kind: "file", mode: mode, mtimeNS: mtime,
+                size: size, chunks: chunks, lengths: lengths, target: nil, tree: nil
+            ))
+        }
+
+        func appendLink(name: String, info: StatInfo, target: String, build: DirBuild) {
+            guard trees != nil else { return }
+            build.nodes.append(TreeNode(
+                name: name, kind: "link", mode: info.mode, mtimeNS: info.mtimeNS,
+                size: info.size, chunks: nil, lengths: nil, target: target, tree: nil
+            ))
+        }
+
+        func appendDir(name: String, info: StatInfo, tree: String, build: DirBuild) {
+            guard trees != nil else { return }
+            build.nodes.append(TreeNode(
+                name: name, kind: "dir", mode: info.mode, mtimeNS: info.mtimeNS,
+                size: nil, chunks: nil, lengths: nil, target: nil, tree: tree
+            ))
+        }
+
+        func commit(_ nodes: [TreeNode]) throws -> String {
+            guard let trees else { return "" }
+            let data = try JSONFile.encoder(pretty: false).encode(nodes)
+            return try trees.put(data).hash
+        }
+
+        func loadPrior(relative: String, parentHash: String?) throws -> [String: Prior] {
+            switch history {
+            case .none, .blank:
+                return [:]
+            case .inline(_, _, let kids, _):
+                var map: [String: Prior] = [:]
+                for (name, entry) in kids[relative] ?? [:] where map[name] == nil {
+                    map[name] = Prior.from(entry: entry)
+                }
+                return map
+            case .tree:
+                guard let parentHash else { return [:] }
+                var map: [String: Prior] = [:]
+                for node in try Vault.readNodes(vault, parentHash) where map[node.name] == nil {
+                    map[node.name] = Prior.from(node: node)
+                }
+                return map
+            }
+        }
+
+        func join(_ parent: String, _ name: String) -> String {
+            parent.isEmpty ? name : parent + "/" + name
+        }
     }
 
-    /// The first entry for a path wins. A repeated path in a damaged manifest must not crash the process.
-    private static func entriesByPath(_ entries: [Entry]) -> [String: Entry] {
-        var map: [String: Entry] = [:]
-        map.reserveCapacity(entries.count)
-        for entry in entries where map[entry.path] == nil {
-            map[entry.path] = entry
-        }
-        return map
-    }
 
     private static func ensureConfig(vault: URL, source: URL, name: String) throws -> VaultConfig {
         try FileManager.default.createDirectory(at: vault.appendingPathComponent("chunks"), withIntermediateDirectories: true)
@@ -1906,20 +2726,6 @@ enum Vault {
         try AppInfo.format.appending("\n").write(to: vault.appendingPathComponent("FORMAT"), atomically: true, encoding: .utf8)
         try JSONFile.write(config, to: configURL, pretty: true)
         return config
-    }
-
-    private static func classify(_ entry: Entry, parent: Entry?, stats: inout SnapshotStats, newBytes: Int64, reusedBytes: Int64) {
-        guard let parent else {
-            stats.addedFiles += 1
-            return
-        }
-        if parent.kind != entry.kind || parent.chunks != entry.chunks || parent.target != entry.target || parent.size != entry.size || parent.mode != entry.mode {
-            stats.changedFiles += 1
-        } else {
-            stats.unchangedFiles += 1
-        }
-        _ = newBytes
-        _ = reusedBytes
     }
 
     private static func ingest(
@@ -1953,75 +2759,6 @@ enum Vault {
         if isCancelled?() == true {
             throw ChronicleError.snapshotCancelled
         }
-    }
-
-    private static func collect(
-        source: URL,
-        vault: URL,
-        skip: Set<String>,
-        progress: ((String) -> Void)?,
-        isCancelled: (() -> Bool)?
-    ) throws -> (items: [WalkItem], skipped: [String]) {
-        let rootPath = source.path
-        let vaultPath = vault.resolvingSymlinksInPath().path
-        let box = SkipBox()
-        guard let enumerator = FileManager.default.enumerator(
-            at: source,
-            includingPropertiesForKeys: nil,
-            options: [],
-            errorHandler: { url, _ in
-                let relative = relativePath(url.path, rootPath)
-                if !relative.isEmpty { box.paths.append(relative) }
-                return true
-            }
-        ) else {
-            throw ChronicleError.fail("Could not read \(rootPath).")
-        }
-
-        var items: [WalkItem] = []
-        while let url = enumerator.nextObject() as? URL {
-            try stopIfCancelled(isCancelled)
-            let name = url.lastPathComponent
-            let path = url.path
-            let relative = relativePath(path, rootPath)
-            if relative.isEmpty { continue }
-            guard let info = lstatInfo(path) else {
-                box.paths.append(relative)
-                continue
-            }
-            let excluded = skip.contains(name) || path == vaultPath || path.hasPrefix(vaultPath + "/")
-            // skipDescendants drops the next directory when the current item is not one.
-            // A file, a pipe, or a symlink — including a symlink to a folder — must not call it.
-            // Only a real directory has children, and only an excluded directory skips them.
-            if excluded {
-                if info.kind == "dir" { enumerator.skipDescendants() }
-                box.paths.append(relative)
-                continue
-            }
-            progress?(relative)
-            switch info.kind {
-            case "dir":
-                items.append(WalkItem(
-                    relative: relative, kind: "dir", mode: info.mode, mtimeNS: info.mtimeNS,
-                    size: 0, linkTarget: nil, absolute: path
-                ))
-            case "link":
-                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: path)) ?? ""
-                items.append(WalkItem(
-                    relative: relative, kind: "link", mode: info.mode, mtimeNS: info.mtimeNS,
-                    size: info.size, linkTarget: target, absolute: path
-                ))
-            case "file":
-                items.append(WalkItem(
-                    relative: relative, kind: "file", mode: info.mode, mtimeNS: info.mtimeNS,
-                    size: info.size, linkTarget: nil, absolute: path
-                ))
-            default:
-                box.paths.append(relative)
-            }
-        }
-        items.sort { $0.relative < $1.relative }
-        return (items, box.paths)
     }
 
     private static func guardDestination(_ dest: URL, source: String, vault: URL, allowInsideSource: Bool) throws {

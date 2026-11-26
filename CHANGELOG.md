@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.26
+
+- A snapshot walks one folder at a time and does not keep every file's chunk list in memory. Stop still drops an unfinished version.
+
 ## 1.0.25
 
 - Stop ends a snapshot before the version is saved. The previous version stays, and chunks from the attempt are removed. A stop that arrives after the version is saved says so.

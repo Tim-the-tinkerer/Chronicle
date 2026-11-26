@@ -712,26 +712,24 @@ struct Snapshot: Codable, Equatable {
     /// or when the carried and unreadable paths are not the same set as the parent.
     /// Carrying the same unreadable folder forward again is not a new version.
     /// A version that is kept still records those counts.
+    /// The sets are the stored skip list, which keeps at most 200 paths.
     static func shouldKeep(
         reason: String,
         stats: SnapshotStats,
-        parent: Snapshot?,
-        files: [Entry],
-        skipped: [String],
-        skip: Set<String>
+        carried: Set<String>,
+        unread: Set<String>,
+        parentCarried: Set<String>,
+        parentUnread: Set<String>
     ) -> Bool {
         if reason == "manual" || reason == "first" || reason == "cli" { return true }
         // Directories count in these totals. A directory modification time
         // does not: Finder moves it by writing a skipped name such as .DS_Store.
         if stats.addedFiles > 0 || stats.changedFiles > 0 || stats.removedFiles > 0 { return true }
-        let current = access(files: files, skipped: skipped, skip: skip)
-        let previous = parent.map { access(files: $0.files, skipped: $0.skipped, skip: skip) }
-            ?? (carried: Set<String>(), unread: Set<String>())
-        return current.carried != previous.carried || current.unread != previous.unread
+        return carried != parentCarried || unread != parentUnread
     }
 
     /// Paths the version could not read. Carried paths are stored. Unreadable paths are not.
-    private static func access(
+    static func access(
         files: [Entry],
         skipped: [String],
         skip: Set<String>
@@ -878,6 +876,12 @@ struct BrowserRow: Identifiable, Equatable {
     var newBytes: Int64
     var chunkCount: Int
     var id: String { path }
+}
+
+/// The file list for one version, built without holding every chunk id.
+struct VersionBrowse: Equatable {
+    var rows: [BrowserRow]
+    var folders: [String]
 }
 
 enum Diff {

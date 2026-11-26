@@ -3,6 +3,7 @@ import Foundation
 
 enum SelfTest {
     static func run() -> String? {
+        Vault.retainFilesForTest = true
         let tests: [() -> String?] = [
             testBuzhashLocal,
             testSmallFileIsOneChunk,
@@ -63,6 +64,8 @@ enum SelfTest {
             testVersionDaysGroupPreviousDays,
             testThinningSaysWhatItRemoved,
             testThinningHistoryTotalsSinceLoggingBegan,
+            testStreamingBrowseMatchesTheDiff,
+            testSnapshotLeavesTheFileListEmpty,
         ]
         for test in tests {
             if let error = test() { return error }
@@ -933,9 +936,8 @@ enum SelfTest {
             let fresh = randomData(count: 300, seed: 77)
             try fresh.write(to: source.appendingPathComponent("a-new.bin"))
             try Data("b-new".utf8).write(to: source.appendingPathComponent("b-new.txt"))
-            // collect reports each path once, then buildContents reports it again.
-            // The second report of b-new.txt is after a-new.bin has been stored.
-            // Stopping on that read discards the new chunk and does not publish.
+            // Each path is reported once, in name order. b-new.txt starts after a-new.bin
+            // has been stored. Stopping there discards the new chunk and does not publish.
             let reports = StopReports()
             do {
                 _ = try Vault.snapshot(
@@ -945,7 +947,7 @@ enum SelfTest {
                     reason: "manual",
                     verify: false,
                     progress: { reports.note($0) },
-                    isCancelled: { reports.count("b-new.txt") >= 2 }
+                    isCancelled: { reports.count("b-new.txt") >= 1 }
                 )
                 return "stop: snapshot published a version"
             } catch let error as ChronicleError {
@@ -953,7 +955,7 @@ enum SelfTest {
                     return "stop: \(error.message)"
                 }
             }
-            if reports.count("a-new.bin") < 2 {
+            if reports.count("a-new.bin") < 1 {
                 return "stop: a-new.bin was not read before the stop"
             }
             let names = (try? FileManager.default.contentsOfDirectory(atPath: vault.appendingPathComponent("snapshots").path)) ?? []
@@ -3382,6 +3384,112 @@ enum SelfTest {
             out.append(state.hash)
         }
         return out
+    }
+
+    /// Opening a tree-format version lists the same rows as the expanded diff, without requiring that expansion to build them.
+    private static func testStreamingBrowseMatchesTheDiff() -> String? {
+        let root = temp("browse")
+        let secret = root.appendingPathComponent("source/secret.txt")
+        defer {
+            _ = chmod(secret.path, 0o644)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("empty"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("stay"), withIntermediateDirectories: true)
+            try Data("same".utf8).write(to: source.appendingPathComponent("same.txt"))
+            try Data("edit".utf8).write(to: source.appendingPathComponent("edit.txt"))
+            try Data("gone".utf8).write(to: source.appendingPathComponent("gone.txt"))
+            try Data("secret".utf8).write(to: secret)
+            try Data("stay".utf8).write(to: source.appendingPathComponent("stay/keep.txt"))
+            guard try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) != nil else {
+                return "browse: first snapshot was empty"
+            }
+            try Data("edited".utf8).write(to: source.appendingPathComponent("edit.txt"))
+            try FileManager.default.removeItem(at: source.appendingPathComponent("gone.txt"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("added"), withIntermediateDirectories: true)
+            try Data("secret two".utf8).write(to: secret)
+            if chmod(secret.path, 0) != 0 { return "browse: could not hide secret.txt" }
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "browse: second snapshot was empty"
+            }
+            let loaded = try Vault.load(vault, snap.id)
+            let basis = Vault.compared(vault: vault, to: loaded)
+            let warnings = loaded.warnings(skipNames: Set(VaultConfig.defaultSkip))
+            let expected = Diff.rows(
+                current: loaded.files,
+                parent: basis.parent?.files,
+                comparable: basis.comparable,
+                carried: warnings.carried,
+                unread: warnings.unread
+            )
+            let listed = try Vault.listVersion(vault, snap.id)
+            if listed.rows != expected {
+                return "browse: rows were \(listed.rows) expected \(expected)"
+            }
+            let folders = loaded.files.compactMap { $0.kind == "dir" ? $0.path : nil }.sorted()
+            if listed.folders != folders {
+                return "browse: folders were \(listed.folders) expected \(folders)"
+            }
+            if !listed.rows.contains(where: { $0.path == "same.txt" && $0.change == "same" }) {
+                return "browse: an unchanged file was dropped"
+            }
+            if !listed.rows.contains(where: { $0.path == "gone.txt" && $0.change == "removed" }) {
+                return "browse: a removed file was dropped"
+            }
+            if !listed.rows.contains(where: { $0.path == "secret.txt" && $0.change == "carried" }) {
+                return "browse: a carried file was dropped"
+            }
+            if listed.rows.contains(where: { $0.path == "empty" }) {
+                return "browse: an unchanged folder was listed"
+            }
+            if !listed.folders.contains("empty") || !listed.folders.contains("added") {
+                return "browse: a folder was missing from \(listed.folders)"
+            }
+            return nil
+        } catch {
+            return "browse: \(error.localizedDescription)"
+        }
+    }
+
+    /// A normal snapshot keeps the directory record and does not bring the file list back into memory.
+    private static func testSnapshotLeavesTheFileListEmpty() -> String? {
+        let root = temp("memory-list")
+        defer {
+            Vault.retainFilesForTest = true
+            try? FileManager.default.removeItem(at: root)
+        }
+        Vault.retainFilesForTest = false
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("nest"), withIntermediateDirectories: true)
+            try Data("one".utf8).write(to: source.appendingPathComponent("nest/a.txt"))
+            try Data("two".utf8).write(to: source.appendingPathComponent("b.txt"))
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "memory: snapshot was empty"
+            }
+            if !snap.files.isEmpty {
+                return "memory: the snapshot kept \(snap.files.count) files"
+            }
+            if snap.tree == nil || snap.tree?.isEmpty == true {
+                return "memory: the snapshot has no directory record"
+            }
+            let loaded = try Vault.load(vault, snap.id)
+            if loaded.files.count != 3 {
+                return "memory: the version loaded \(loaded.files.count) files"
+            }
+            let dest = root.appendingPathComponent("out")
+            try Vault.restore(vault: vault, snapshot: snap.id, dest: dest, allowInsideSource: false)
+            if try Data(contentsOf: dest.appendingPathComponent("nest/a.txt")) != Data("one".utf8) {
+                return "memory: the nested file did not restore"
+            }
+            return nil
+        } catch {
+            return "memory: \(error.localizedDescription)"
+        }
     }
 
     private static func randomData(count: Int, seed: UInt64) -> Data {

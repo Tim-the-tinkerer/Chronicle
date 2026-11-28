@@ -43,6 +43,7 @@ enum SelfTest {
             testDuplicatePathsDoNotCrash,
             testBrokenIndexIsRebuilt,
             testHeadWithoutAVersionIsNotListed,
+            testHealthyHeadIsReadOnce,
             testEmptyFileListKeepsTreeChunks,
             testOversizedChunkIsSetAside,
             testDamagedSiblingIsReplaced,
@@ -68,6 +69,8 @@ enum SelfTest {
             testSnapshotLeavesTheFileListEmpty,
             testSetupLeavesOutAFolderBeforeTheFirstSnapshot,
             testVersionTreeGroupsTheFiles,
+            testOpeningADirectoryDoesNotReadItsChildren,
+            testADatabaseWalkWaitsWhileAFolderIsOpen,
         ]
         for test in tests {
             if let error = test() { return error }
@@ -2006,6 +2009,50 @@ enum SelfTest {
         }
     }
 
+    /// A healthy header is opened once per listing, including when several versions are present.
+    private static func testHealthyHeadIsReadOnce() -> String? {
+        let root = temp("head-once")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            try Data("one".utf8).write(to: source.appendingPathComponent("one.txt"))
+            guard let first = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "heads: no first version"
+            }
+            try Data("two".utf8).write(to: source.appendingPathComponent("two.txt"))
+            guard let second = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "heads: no second version"
+            }
+            let before = Vault.headFileReadCount()
+            let heads = try Vault.listHeads(vault)
+            let reads = Vault.headFileReadCount() - before
+            if heads.map(\.id) != [second.id, first.id] {
+                return "heads: listed \(heads.map(\.id))"
+            }
+            if reads != heads.count {
+                return "heads: \(reads) header reads for \(heads.count) versions"
+            }
+            let directory = vault.appendingPathComponent("snapshots")
+            try FileManager.default.removeItem(at: directory.appendingPathComponent(first.id + ".head.json"))
+            let missing = Vault.headFileReadCount()
+            let rebuilt = try Vault.listHeads(vault)
+            if rebuilt.map(\.id) != [second.id, first.id] {
+                return "heads: a missing index changed \(rebuilt.map(\.id))"
+            }
+            if Vault.headFileReadCount() - missing != 1 {
+                return "heads: rebuilding one index read \(Vault.headFileReadCount() - missing) headers"
+            }
+            if !FileManager.default.fileExists(atPath: directory.appendingPathComponent(first.id + ".head.json").path) {
+                return "heads: the missing index was not written back"
+            }
+            return nil
+        } catch {
+            return "heads: \(error.localizedDescription)"
+        }
+    }
+
     /// A head file without its version file is not a version, and the next open removes it.
     private static func testHeadWithoutAVersionIsNotListed() -> String? {
         let root = temp("orphan-head")
@@ -3567,6 +3614,167 @@ enum SelfTest {
         return nil
     }
 
+    /// Opening a version reads one directory. A nested file stays unread until that folder is opened.
+    private static func testOpeningADirectoryDoesNotReadItsChildren() -> String? {
+        let root = temp("one-dir")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("sub/nested"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("empty"), withIntermediateDirectories: true)
+            try Data("a".utf8).write(to: source.appendingPathComponent("a.txt"))
+            try Data("b".utf8).write(to: source.appendingPathComponent("sub/b.txt"))
+            try Data("c".utf8).write(to: source.appendingPathComponent("sub/nested/c.txt"))
+            guard let first = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "open: snapshot was empty"
+            }
+            let top = try Vault.listDirectory(vault, first.id, "")
+            if top.map(\.path) != ["empty", "sub", "a.txt"] {
+                return "open: root was \(top.map(\.path))"
+            }
+            if top.contains(where: { $0.path == "sub/b.txt" || $0.path == "sub/nested/c.txt" }) {
+                return "open: root listed a nested file"
+            }
+            let sub = try Vault.listDirectory(vault, first.id, "sub")
+            if sub.map(\.path) != ["sub/nested", "sub/b.txt"] {
+                return "open: sub was \(sub.map(\.path))"
+            }
+            if sub.contains(where: { $0.path == "sub/nested/c.txt" }) {
+                return "open: sub listed a nested file"
+            }
+            if try !Vault.listDirectory(vault, first.id, "empty").isEmpty {
+                return "open: empty listed \(try Vault.listDirectory(vault, first.id, "empty").map(\.path))"
+            }
+            try Data("c2".utf8).write(to: source.appendingPathComponent("sub/nested/c.txt"))
+            guard let second = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "open: the edited snapshot was empty"
+            }
+            let nested = try Vault.listDirectory(vault, second.id, "sub/nested")
+            if nested.first(where: { $0.path == "sub/nested/c.txt" })?.change != "changed" {
+                return "open: nested file was \(nested.map { "\($0.path) \($0.change)" })"
+            }
+            try FileManager.default.removeItem(at: source.appendingPathComponent("sub/b.txt"))
+            guard let third = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "open: the removed snapshot was empty"
+            }
+            let subLater = try Vault.listDirectory(vault, third.id, "sub")
+            if subLater.first(where: { $0.path == "sub/b.txt" })?.change != "removed" {
+                return "open: removed file was \(subLater.map { "\($0.path) \($0.change)" })"
+            }
+            if subLater.first(where: { $0.path == "sub/nested" }) == nil {
+                return "open: nested folder was missing"
+            }
+            let found = try Vault.findEntries(vault, third.id, "c.txt")
+            if !found.rows.contains(where: { $0.path == "sub/nested/c.txt" }) {
+                return "open: search missed c.txt in \(found.rows.map(\.path))"
+            }
+            if found.rows.contains(where: { $0.path == "a.txt" }) {
+                return "open: search kept a.txt"
+            }
+            return nil
+        } catch {
+            return "open: \(error.localizedDescription)"
+        }
+    }
+
+    /// Counting every stored file waits while a snapshot or folder is being read, then finishes.
+    private static func testADatabaseWalkWaitsWhileAFolderIsOpen() -> String? {
+        let root = temp("walk-wait")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let vault = root.appendingPathComponent("vault")
+        var held = false
+        defer {
+            if held { Vault.endFolderRead() }
+        }
+        do {
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("sub"), withIntermediateDirectories: true)
+            try Data("a".utf8).write(to: source.appendingPathComponent("a.txt"))
+            try Data("b".utf8).write(to: source.appendingPathComponent("sub/b.txt"))
+            guard let snap = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
+                return "walk: snapshot was empty"
+            }
+            let before = Vault.folderReadPauseCount()
+            Vault.beginFolderRead()
+            held = true
+            let lock = NSLock()
+            var done = false
+            var measured: VaultTotals?
+            var problem: String?
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let totals = try Vault.totals(vault)
+                    lock.lock()
+                    measured = totals
+                    done = true
+                    lock.unlock()
+                } catch {
+                    lock.lock()
+                    problem = error.localizedDescription
+                    done = true
+                    lock.unlock()
+                }
+            }
+            var sawPause = false
+            for _ in 0..<100 {
+                if Vault.folderReadPauseCount() > before {
+                    sawPause = true
+                    break
+                }
+                lock.lock()
+                let finished = done
+                lock.unlock()
+                if finished { break }
+                Thread.sleep(forTimeInterval: 0.025)
+            }
+            if !sawPause {
+                return "walk: counting stored files did not wait for the open folder"
+            }
+            let top = try Vault.listDirectory(vault, snap.id, "")
+            if top.map(\.path) != ["sub", "a.txt"] {
+                return "walk: the open folder was \(top.map(\.path))"
+            }
+            let sub = try Vault.listDirectory(vault, snap.id, "sub")
+            if sub.map(\.path) != ["sub/b.txt"] {
+                return "walk: the inner folder was \(sub.map(\.path))"
+            }
+            lock.lock()
+            let finishedEarly = done
+            lock.unlock()
+            if finishedEarly {
+                return "walk: the stored-file count finished while a folder was open"
+            }
+            Vault.endFolderRead()
+            held = false
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                lock.lock()
+                let finished = done
+                lock.unlock()
+                if finished { break }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            lock.lock()
+            let finished = done
+            let totals = measured
+            let message = problem
+            lock.unlock()
+            if let message { return "walk: \(message)" }
+            if !finished { return "walk: the stored-file count did not finish after the folder was read" }
+            if totals?.snapshotCount != 1 {
+                return "walk: counted \(totals?.snapshotCount ?? -1) versions"
+            }
+            let expectedChunks = regularFileBytes(vault.appendingPathComponent("chunks"))
+            if totals?.chunkBytes != expectedChunks {
+                return "walk: chunk bytes \(totals?.chunkBytes ?? -1) were not \(expectedChunks)"
+            }
+            return nil
+        } catch {
+            return "walk: \(error.localizedDescription)"
+        }
+    }
+
     /// Add Folder writes the skip list before the first snapshot, so a dot folder is never read.
     private static func testSetupLeavesOutAFolderBeforeTheFirstSnapshot() -> String? {
         let added = FolderSetup.skipNames(
@@ -3607,6 +3815,12 @@ enum SelfTest {
             try Data("keep".utf8).write(to: source.appendingPathComponent("keep.txt"))
             try FileManager.default.createDirectory(at: source.appendingPathComponent(".git"), withIntermediateDirectories: true)
             try Data("git".utf8).write(to: source.appendingPathComponent(".git/config"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("notes/.git"), withIntermediateDirectories: true)
+            try Data("nested-git".utf8).write(to: source.appendingPathComponent("notes/.git/config"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("Cache"), withIntermediateDirectories: true)
+            try Data("drop".utf8).write(to: source.appendingPathComponent("Cache/secret.txt"))
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("Projects/Cache"), withIntermediateDirectories: true)
+            try Data("keep-cache".utf8).write(to: source.appendingPathComponent("Projects/Cache/kept.txt"))
             let real = source.appendingPathComponent("real")
             try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
             try Data("inside".utf8).write(to: real.appendingPathComponent("inside.txt"))
@@ -3616,11 +3830,11 @@ enum SelfTest {
             )
             let listing = FolderSetup.folders(in: source)
             if listing.unreadable { return "setup: the folder could not be listed" }
-            let wantedFolders = [".SynologyWorkingDirectory", ".git", "notes", "real"]
+            let wantedFolders = [".SynologyWorkingDirectory", ".git", "Cache", "Projects", "notes", "real"]
             if listing.names != wantedFolders {
                 return "setup: listed \(listing.names)"
             }
-            let excluded = Set(wantedFolders.filter { VaultConfig.defaultSkip.contains($0) }).union([".SynologyWorkingDirectory"])
+            let excluded = Set(wantedFolders.filter { VaultConfig.defaultSkip.contains($0) }).union([".SynologyWorkingDirectory", "Cache"])
             let skip = FolderSetup.skipNames(folders: listing.names, excluded: excluded)
             if !skip.contains(".SynologyWorkingDirectory") || !skip.contains(".git") {
                 return "setup: the stored list was \(skip)"
@@ -3634,7 +3848,12 @@ enum SelfTest {
                 return "setup: snapshot was empty"
             }
             let paths = Set(snap.files.map(\.path))
-            for path in ["keep.txt", "notes", "notes/a.txt", "real", "real/inside.txt", "linkdir"] where !paths.contains(path) {
+            let kept = [
+                "keep.txt", "notes", "notes/a.txt", "real", "real/inside.txt", "linkdir",
+                "notes/.SynologyWorkingDirectory", "notes/.SynologyWorkingDirectory/also.txt",
+                "Projects", "Projects/Cache", "Projects/Cache/kept.txt",
+            ]
+            for path in kept where !paths.contains(path) {
                 return "setup: \(path) was missing from \(paths.sorted())"
             }
             let hidden = [
@@ -3642,26 +3861,38 @@ enum SelfTest {
                 ".SynologyWorkingDirectory/secret.txt",
                 ".SynologyWorkingDirectory/nested",
                 ".SynologyWorkingDirectory/nested/deep.txt",
-                "notes/.SynologyWorkingDirectory",
-                "notes/.SynologyWorkingDirectory/also.txt",
+                "Cache",
+                "Cache/secret.txt",
                 ".git",
                 ".git/config",
+                "notes/.git",
+                "notes/.git/config",
             ]
             for path in hidden where paths.contains(path) {
                 return "setup: \(path) was stored"
             }
-            if !snap.skipped.contains(".SynologyWorkingDirectory") || !snap.skipped.contains("notes/.SynologyWorkingDirectory") {
-                return "setup: the dot folder was not recorded in \(snap.skipped)"
+            if !snap.skipped.contains(".SynologyWorkingDirectory") || !snap.skipped.contains("Cache") {
+                return "setup: the checked folder was not recorded in \(snap.skipped)"
             }
-            if snap.skipped.contains(".SynologyWorkingDirectory/secret.txt") {
+            if snap.skipped.contains("notes/.SynologyWorkingDirectory") || snap.skipped.contains("Projects/Cache") {
+                return "setup: a nested folder with the checked name was left out"
+            }
+            if snap.skipped.contains(".SynologyWorkingDirectory/secret.txt") || snap.skipped.contains("Cache/secret.txt") {
                 return "setup: Chronicle read inside the excluded folder"
             }
             try Data("later".utf8).write(to: source.appendingPathComponent(".SynologyWorkingDirectory/later.txt"))
             guard let again = try Vault.snapshot(source: source, vault: vault, label: "", reason: "manual", verify: false) else {
                 return "setup: the next snapshot was empty"
             }
-            if again.files.contains(where: { $0.path.hasPrefix(".SynologyWorkingDirectory") || $0.path.contains("/.SynologyWorkingDirectory") }) {
+            if again.files.contains(where: {
+                $0.path == ".SynologyWorkingDirectory" || $0.path.hasPrefix(".SynologyWorkingDirectory/")
+                    || $0.path == "Cache" || $0.path.hasPrefix("Cache/")
+            }) {
                 return "setup: a later snapshot read the excluded folder"
+            }
+            if !again.files.contains(where: { $0.path == "Projects/Cache/kept.txt" })
+                || !again.files.contains(where: { $0.path == "notes/.SynologyWorkingDirectory/also.txt" }) {
+                return "setup: a later snapshot left out a nested folder with the checked name"
             }
             if try Vault.config(vault).skipNames != skip {
                 return "setup: the snapshot replaced the skip list"
@@ -3696,6 +3927,23 @@ enum SelfTest {
             data[index] = UInt8(truncatingIfNeeded: mix.next())
         }
         return data
+    }
+
+    /// Logical size of regular files, the same sum `directoryBytes` has to match.
+    private static func regularFileBytes(_ url: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: []
+        ) else { return -1 }
+        var sum: Int64 = 0
+        for case let file as URL in enumerator {
+            let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values?.isRegularFile == true {
+                sum += Int64(values?.fileSize ?? 0)
+            }
+        }
+        return sum
     }
 
     private static func temp(_ name: String) -> URL {

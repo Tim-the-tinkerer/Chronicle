@@ -451,6 +451,7 @@ enum Vault {
         let trees = TreeStore(root: vault)
         var committed = false
         defer {
+            invalidateTotals(vault.path)
             if !committed {
                 store.discardNew()
                 trees.discardNew()
@@ -571,31 +572,45 @@ enum Vault {
         )
     }
 
+    /// How many version headers `listHeads` has opened. A healthy header counts once per call.
+    private static var headFileReads = 0
+
+    static func headFileReadCount() -> Int { headFileReads }
+
     static func listHeads(_ vault: URL) throws -> [SnapshotHead] {
         let directory = vault.appendingPathComponent("snapshots")
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         var heads: [SnapshotHead] = []
+        var got = Set<String>()
         let seen = Set(names)
         for name in names where name.hasSuffix(".json") && !name.hasSuffix(".head.json") {
             let id = String(name.dropLast(".json".count))
             guard SnapshotID.valid(id) else { continue }
             let headURL = directory.appendingPathComponent(id + ".head.json")
             if seen.contains(headURL.lastPathComponent),
-               let head = try? JSONFile.read(SnapshotHead.self, from: headURL),
+               let head = readHeadFile(headURL),
                head.id == id {
+                heads.append(head)
+                got.insert(id)
                 continue
             }
             // A missing or unreadable index is rebuilt from the version file.
-            if let snap = try? load(vault, id) {
-                try? JSONFile.write(snap.head, to: headURL, pretty: true)
-                heads.append(snap.head)
+            // The directory records are not read. Opening the version does that.
+            if let stored = try? readStored(vault, id) {
+                let head = stored.snapshot().head
+                try? JSONFile.write(head, to: headURL, pretty: true)
+                heads.append(head)
+                got.insert(id)
             }
         }
         for name in names where name.hasSuffix(".head.json") && !name.contains(".partial") {
+            let id = String(name.dropLast(".head.json".count))
+            // The pass above already kept this header. Do not open it again.
+            if got.contains(id) { continue }
             let url = directory.appendingPathComponent(name)
-            guard let head = try? JSONFile.read(SnapshotHead.self, from: url), SnapshotID.valid(head.id) else { continue }
+            guard let head = readHeadFile(url), SnapshotID.valid(head.id) else { continue }
             // A head is an index. The version file is the version.
-            guard seen.contains(head.id + ".json") else { continue }
+            guard seen.contains(head.id + ".json"), got.insert(head.id).inserted else { continue }
             heads.append(head)
         }
         heads.sort { lhs, rhs in
@@ -608,6 +623,11 @@ enum Vault {
             unique.append(head)
         }
         return unique
+    }
+
+    private static func readHeadFile(_ url: URL) -> SnapshotHead? {
+        headFileReads += 1
+        return try? JSONFile.read(SnapshotHead.self, from: url)
     }
 
     static func latestDate(_ vault: URL) -> Date? {
@@ -710,7 +730,107 @@ enum Vault {
         return VersionGlance(newBytes: stats.newChunkBytes, quiet: quiet)
     }
 
+    /// Version rows from the counts already stored on each head. No directory record is read.
+    static func storedGlances(_ heads: [SnapshotHead]) -> [String: VersionGlance] {
+        var shown: [String: VersionGlance] = [:]
+        shown.reserveCapacity(heads.count)
+        for head in heads {
+            shown[head.id] = storedGlance(head.stats)
+        }
+        return shown
+    }
+
+    /// A snapshot or folder is on screen. Walks of every chunk and directory record wait.
+    /// The thread that is reading the folder does not wait on itself.
+    private static let folderReadLock = NSLock()
+    private static let folderReadKey = "com.tim.chronicle.folderRead"
+    private static var folderReads = 0
+    private static var folderReadPauses = 0
+
+    static func beginFolderRead() {
+        let depth = (Thread.current.threadDictionary[folderReadKey] as? Int) ?? 0
+        Thread.current.threadDictionary[folderReadKey] = depth + 1
+        folderReadLock.lock()
+        folderReads += 1
+        folderReadLock.unlock()
+    }
+
+    static func endFolderRead() {
+        let depth = (Thread.current.threadDictionary[folderReadKey] as? Int) ?? 0
+        if depth > 1 {
+            Thread.current.threadDictionary[folderReadKey] = depth - 1
+        } else {
+            Thread.current.threadDictionary.removeObject(forKey: folderReadKey)
+        }
+        folderReadLock.lock()
+        if folderReads > 0 { folderReads -= 1 }
+        folderReadLock.unlock()
+    }
+
+    static func folderReadPauseCount() -> Int {
+        folderReadLock.lock()
+        let value = folderReadPauses
+        folderReadLock.unlock()
+        return value
+    }
+
+    /// Stops a database walk while another thread is reading a snapshot or folder.
+    private static func pauseForFolderRead() {
+        while true {
+            let mine = ((Thread.current.threadDictionary[folderReadKey] as? Int) ?? 0) > 0
+            folderReadLock.lock()
+            let busy = folderReads > 0 && !mine
+            if busy { folderReadPauses += 1 }
+            folderReadLock.unlock()
+            if !busy { return }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
     static func totals(_ vault: URL) throws -> VaultTotals {
+        var latest: VaultTotals?
+        // A snapshot during the walk changes the generation. Count again, a few times,
+        // and keep the figure only when nothing changed underneath it.
+        for _ in 0..<3 {
+            totalsLock.lock()
+            let generation = totalsGeneration[vault.path] ?? 0
+            if let cached = totalsCache[vault.path], cached.generation == generation {
+                totalsLock.unlock()
+                return cached.totals
+            }
+            totalsLock.unlock()
+            let measured = try measureTotals(vault)
+            latest = measured
+            totalsLock.lock()
+            if (totalsGeneration[vault.path] ?? 0) == generation {
+                totalsCache[vault.path] = (generation, measured)
+                totalsLock.unlock()
+                return measured
+            }
+            totalsLock.unlock()
+        }
+        return latest ?? VaultTotals(
+            snapshotCount: 0,
+            storedBytes: 0,
+            chunkBytes: 0,
+            manifestBytes: 0,
+            rawCopyBytes: 0,
+            latestLogicalBytes: 0
+        )
+    }
+
+    /// The next totals read walks the vault again. A snapshot, delete, or cleanup calls this.
+    static func invalidateTotals(_ path: String) {
+        totalsLock.lock()
+        totalsGeneration[path, default: 0] += 1
+        totalsLock.unlock()
+    }
+
+    private static let totalsLock = NSLock()
+    private static var totalsCache: [String: (generation: Int, totals: VaultTotals)] = [:]
+    private static var totalsGeneration: [String: Int] = [:]
+
+    private static func measureTotals(_ vault: URL) throws -> VaultTotals {
         let heads = try listHeads(vault)
         let chunkBytes = directoryBytes(vault.appendingPathComponent("chunks"))
         var manifestBytes = directoryBytes(vault.appendingPathComponent("snapshots"))
@@ -832,6 +952,7 @@ enum Vault {
         }
         try FileManager.default.removeItem(at: body)
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(id + ".head.json"))
+        invalidateTotals(vault.path)
         do {
             let result = try collectGarbage(vault)
             guard result.complete else {
@@ -900,9 +1021,21 @@ enum Vault {
         return HistoryCheck(versionCount: versionCount, chunkCount: users.count, problems: problems)
     }
 
+    /// Launch maintenance. `recount` is set when stored bytes changed and the version list did not.
+    struct HealOutcome {
+        var pruned: PruneResult
+        var recount: Bool
+    }
+
     @discardableResult
     static func heal(_ vault: URL) throws -> PruneResult {
-        guard FileManager.default.fileExists(atPath: vault.path) else { return .none }
+        try healOutcome(vault).pruned
+    }
+
+    static func healOutcome(_ vault: URL) throws -> HealOutcome {
+        guard FileManager.default.fileExists(atPath: vault.path) else {
+            return HealOutcome(pruned: .none, recount: false)
+        }
         let lock = try VaultLock(url: vault.appendingPathComponent("lock"))
         defer { lock.release() }
         return try healUnlocked(vault, pruneHistory: true)
@@ -917,6 +1050,7 @@ enum Vault {
             throw ChronicleError.fail("A version could not be read, so unused chunks were left in place.")
         }
         try? FileManager.default.removeItem(at: vault.appendingPathComponent("pending"))
+        invalidateTotals(vault.path)
         return CleanResult(freed: thinned.freed + result.freed, thinning: thinned)
     }
 
@@ -990,6 +1124,8 @@ enum Vault {
         } catch {
             throw ChronicleError.fail("Snapshots are in \(dest.path). The old copy is still on disk.")
         }
+        invalidateTotals(source.path)
+        invalidateTotals(dest.path)
     }
 
     /// File by file, so a failure mid-copy can delete the partial folder and leave the original.
@@ -1107,13 +1243,13 @@ enum Vault {
         var complete: Bool
     }
 
-    private static func healUnlocked(_ vault: URL, pruneHistory: Bool = false) throws -> PruneResult {
+    private static func healUnlocked(_ vault: URL, pruneHistory: Bool = false) throws -> HealOutcome {
         let names: [String]
         do {
             names = try snapshotDirectoryNames(vault)
         } catch {
             // An unreadable version list is not an empty one. Leave every chunk.
-            return .none
+            return HealOutcome(pruned: .none, recount: false)
         }
         let directory = vault.appendingPathComponent("snapshots")
         for name in names where name.hasSuffix(".partial") {
@@ -1124,17 +1260,22 @@ enum Vault {
             guard SnapshotID.valid(id), !names.contains(id + ".json") else { continue }
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
+        var recount = false
         let pending = vault.appendingPathComponent("pending")
         if FileManager.default.fileExists(atPath: pending.path) {
             let result = try collectGarbage(vault)
+            invalidateTotals(vault.path)
+            recount = true
             if result.complete {
                 try? FileManager.default.removeItem(at: pending)
             }
         }
         if pruneHistory {
-            return (try? pruneUnlocked(vault, now: Date())) ?? .none
+            let pruned = (try? pruneUnlocked(vault, now: Date())) ?? .none
+            if pruned.count > 0 { invalidateTotals(vault.path) }
+            return HealOutcome(pruned: pruned, recount: recount || pruned.count > 0)
         }
-        return .none
+        return HealOutcome(pruned: .none, recount: recount)
     }
 
     private static func collectGarbage(_ vault: URL) throws -> GarbageResult {
@@ -1143,6 +1284,7 @@ enum Vault {
         var liveTrees = Set<String>()
         var complete = true
         for name in names where name.hasSuffix(".json") && !name.hasSuffix(".head.json") {
+            pauseForFolderRead()
             let id = String(name.dropLast(".json".count))
             guard SnapshotID.valid(id) else { continue }
             do {
@@ -1184,6 +1326,7 @@ enum Vault {
         }
         var freed: Int64 = 0
         for case let url as URL in enumerator {
+            pauseForFolderRead()
             let name = url.lastPathComponent
             let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values?.isRegularFile == true else { continue }
@@ -1613,6 +1756,7 @@ enum Vault {
         var files: [Entry] = []
         var stack: [(hash: String, prefix: String, chain: Set<String>)] = [(root, "", [])]
         while let next = stack.popLast() {
+            pauseForFolderRead()
             if next.chain.contains(next.hash) {
                 throw ChronicleError.fail("A directory record repeats itself.")
             }
@@ -1659,6 +1803,7 @@ enum Vault {
         var walk = TreeWalk()
         var pending = [root]
         while let hash = pending.popLast() {
+            pauseForFolderRead()
             if !Digest.isHash(hash) {
                 walk.problems.append((hash, "missing-directory"))
                 continue
@@ -1914,6 +2059,430 @@ enum Vault {
                 skipped: stored.skipped
             )
         }
+    }
+
+    /// The names in one directory. Opening it does not read the directories inside it.
+    static func listDirectory(_ vault: URL, _ id: String, _ directory: String) throws -> [BrowserRow] {
+        beginFolderRead()
+        defer { endFolderRead() }
+        if !directory.isEmpty && !RelPath.isSafe(directory) {
+            throw ChronicleError.fail("Refusing a path that leaves the folder.")
+        }
+        let stored = try readStored(vault, id)
+        let inline = stored.files ?? []
+        if !inline.isEmpty || stored.tree == nil || stored.tree?.isEmpty == true {
+            return direct(try browseExpanded(vault, id), directory)
+        }
+        guard let root = stored.tree else { return [] }
+        let parent = cheapParent(vault, of: stored)
+        let comparable = parent.comparable
+        let access = try accessForDirectory(vault, root: root, directory: directory, skipped: stored.skipped)
+        guard let currentHash = directoryHash(vault, root: root, path: directory) else {
+            guard comparable else { return [] }
+            let gone = try removedDirectory(vault, directory: directory, parent: parent)
+            return FileTree.sorted(gone)
+        }
+        let nodes = try readNodes(vault, currentHash)
+        let previous = try parentNodes(vault, directory: directory, parent: parent, comparable: comparable)
+        let rows = try rowsForDirectory(
+            vault: vault,
+            directory: directory,
+            nodes: nodes,
+            parentNodes: previous,
+            comparable: comparable,
+            carried: access.carried,
+            unread: access.unread
+        )
+        return FileTree.sorted(rows)
+    }
+
+    /// Paths in this version that contain `needle`. Other files are not kept.
+    static func findEntries(_ vault: URL, _ id: String, _ needle: String) throws -> VersionBrowse {
+        let query = needle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return VersionBrowse(rows: [], folders: []) }
+        beginFolderRead()
+        defer { endFolderRead() }
+        let stored = try readStored(vault, id)
+        let inline = stored.files ?? []
+        if !inline.isEmpty || stored.tree == nil || stored.tree?.isEmpty == true {
+            let full = try browseExpanded(vault, id)
+            return VersionBrowse(
+                rows: full.rows.filter { $0.path.lowercased().contains(query) },
+                folders: full.folders.filter { $0.lowercased().contains(query) }
+            )
+        }
+        guard let root = stored.tree, !root.isEmpty else { return VersionBrowse(rows: [], folders: []) }
+        let parent = cheapParent(vault, of: stored)
+        let skip = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
+        var carried = Set<String>()
+        var unread: [String] = []
+        for path in stored.skipped {
+            if RelPath.isExcluded(path, names: skip) { continue }
+            if try nodeExists(vault, root, path) {
+                carried.insert(path)
+            } else {
+                unread.append(path)
+            }
+        }
+        let inlineChildren = parent.entries.map { indexEntries($0) }
+        var rows: [BrowserRow] = []
+        var folders: [String] = []
+        var seen = Set<String>()
+        struct Frame {
+            var hash: String
+            var parentHash: String?
+            var prefix: String
+            var chain: Set<String>
+            var removed: Bool
+        }
+        var stack = [Frame(hash: root, parentHash: parent.root, prefix: "", chain: [], removed: false)]
+        while let frame = stack.popLast() {
+            if frame.chain.contains(frame.hash) {
+                throw ChronicleError.fail("A directory record repeats itself.")
+            }
+            var chain = frame.chain
+            chain.insert(frame.hash)
+            let nodes = try readNodes(vault, frame.hash)
+            if frame.removed {
+                var names = Set<String>()
+                for node in nodes {
+                    if node.name.isEmpty || !names.insert(node.name).inserted { continue }
+                    let path = frame.prefix.isEmpty ? node.name : frame.prefix + "/" + node.name
+                    guard RelPath.isSafe(path) else {
+                        throw ChronicleError.fail("Refusing a path that leaves the folder.")
+                    }
+                    if path.lowercased().contains(query), seen.insert(path).inserted {
+                        rows.append(removedRow(path: path, node: node))
+                    }
+                    if node.kind == "dir", let child = node.tree, Digest.isHash(child) {
+                        stack.append(Frame(hash: child, parentHash: nil, prefix: path, chain: chain, removed: true))
+                    }
+                }
+                continue
+            }
+            var previous: [String: TreeNode] = [:]
+            if parent.comparable, let parentHash = frame.parentHash {
+                for node in try readNodes(vault, parentHash) where previous[node.name] == nil {
+                    previous[node.name] = node
+                }
+            } else if parent.comparable, let children = inlineChildren?[frame.prefix] {
+                for (name, entry) in children where previous[name] == nil {
+                    previous[name] = node(from: entry)
+                }
+            }
+            let listed = try rowsForDirectory(
+                vault: vault,
+                directory: frame.prefix,
+                nodes: nodes,
+                parentNodes: previous,
+                comparable: parent.comparable,
+                carried: carried,
+                unread: unread
+            )
+            for row in listed where row.path.lowercased().contains(query) && seen.insert(row.path).inserted {
+                rows.append(row)
+                if row.kind == "dir" && row.change != "removed" {
+                    folders.append(row.path)
+                }
+            }
+            var names = Set<String>()
+            for node in nodes {
+                if node.name.isEmpty || !names.insert(node.name).inserted { continue }
+                guard node.kind == "dir", let child = node.tree, Digest.isHash(child) else { continue }
+                let path = frame.prefix.isEmpty ? node.name : frame.prefix + "/" + node.name
+                let old = parent.comparable ? previous[node.name] : nil
+                let parentChild = old?.kind == "dir" ? old?.tree : nil
+                stack.append(Frame(hash: child, parentHash: parentChild, prefix: path, chain: chain, removed: false))
+            }
+            if parent.comparable {
+                for (name, old) in previous where !names.contains(name) && old.kind == "dir" {
+                    let path = frame.prefix.isEmpty ? name : frame.prefix + "/" + name
+                    if let child = old.tree, Digest.isHash(child) {
+                        stack.append(Frame(hash: child, parentHash: nil, prefix: path, chain: chain, removed: true))
+                    } else if let entries = parent.entries {
+                        for entry in entries where entry.path.hasPrefix(path + "/") && entry.path.lowercased().contains(query) {
+                            if !seen.insert(entry.path).inserted { continue }
+                            rows.append(BrowserRow(
+                                path: entry.path,
+                                kind: entry.kind,
+                                change: "removed",
+                                size: entry.kind == "dir" ? 0 : entry.size,
+                                newBytes: 0,
+                                chunkCount: entry.chunks.count
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        rows.sort { $0.path < $1.path }
+        folders.sort()
+        return VersionBrowse(rows: rows, folders: folders)
+    }
+
+    /// Every folder recorded in the version. A removed folder is left out.
+    static func foldersInVersion(_ vault: URL, _ id: String) throws -> [String] {
+        beginFolderRead()
+        defer { endFolderRead() }
+        let stored = try readStored(vault, id)
+        let inline = stored.files ?? []
+        if !inline.isEmpty || stored.tree == nil || stored.tree?.isEmpty == true {
+            return try browseExpanded(vault, id).folders
+        }
+        guard let root = stored.tree, !root.isEmpty else { return [] }
+        var folders: [String] = []
+        var stack: [(hash: String, prefix: String, chain: Set<String>)] = [(root, "", [])]
+        while let next = stack.popLast() {
+            if next.chain.contains(next.hash) {
+                throw ChronicleError.fail("A directory record repeats itself.")
+            }
+            var chain = next.chain
+            chain.insert(next.hash)
+            var names = Set<String>()
+            for node in try readNodes(vault, next.hash) {
+                if node.name.isEmpty || !names.insert(node.name).inserted { continue }
+                guard node.kind == "dir", let child = node.tree, Digest.isHash(child) else { continue }
+                let path = next.prefix.isEmpty ? node.name : next.prefix + "/" + node.name
+                guard RelPath.isSafe(path) else {
+                    throw ChronicleError.fail("Refusing a path that leaves the folder.")
+                }
+                folders.append(path)
+                stack.append((child, path, chain))
+            }
+        }
+        folders.sort()
+        return folders
+    }
+
+    private struct CheapParent {
+        var comparable: Bool
+        var root: String?
+        var entries: [Entry]?
+    }
+
+    /// The parent version, without walking its tree. A missing root record tries an older version.
+    private static func cheapParent(_ vault: URL, of stored: StoredSnapshot) -> CheapParent {
+        guard let parentID = stored.parent else { return CheapParent(comparable: true, root: nil, entries: nil) }
+        if let match = usableSnapshot(vault, parentID) { return match }
+        let older = ((try? snapshotIDs(vault)) ?? []).filter { $0 < stored.id }.sorted()
+        for id in older.reversed() {
+            if let match = usableSnapshot(vault, id) { return match }
+        }
+        return CheapParent(comparable: false, root: nil, entries: nil)
+    }
+
+    private static func usableSnapshot(_ vault: URL, _ id: String) -> CheapParent? {
+        guard let stored = try? readStored(vault, id) else { return nil }
+        if let files = stored.files, !files.isEmpty {
+            return CheapParent(comparable: true, root: nil, entries: files)
+        }
+        if let tree = stored.tree, !tree.isEmpty {
+            guard treeRecordExists(vault, tree) else { return nil }
+            return CheapParent(comparable: true, root: tree, entries: nil)
+        }
+        if (stored.files ?? []).isEmpty && (stored.tree ?? "").isEmpty {
+            return CheapParent(comparable: true, root: nil, entries: nil)
+        }
+        return nil
+    }
+
+    /// The root record is present. This does not read or hash it.
+    private static func treeRecordExists(_ vault: URL, _ hash: String) -> Bool {
+        guard Digest.isHash(hash) else { return false }
+        let url = vault
+            .appendingPathComponent("trees")
+            .appendingPathComponent(String(hash.prefix(2)))
+            .appendingPathComponent(hash)
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    /// The directory record for `path`. An empty path is the root. A missing name is nil.
+    private static func directoryHash(_ vault: URL, root: String, path: String) -> String? {
+        guard Digest.isHash(root) else { return nil }
+        if path.isEmpty { return root }
+        var hash = root
+        for part in path.split(separator: "/").map(String.init) {
+            guard let nodes = try? readNodes(vault, hash),
+                  let node = nodes.first(where: { $0.name == part }),
+                  node.kind == "dir",
+                  let child = node.tree,
+                  Digest.isHash(child) else { return nil }
+            hash = child
+        }
+        return hash
+    }
+
+    private static func direct(_ browse: VersionBrowse, _ directory: String) -> [BrowserRow] {
+        var rows: [BrowserRow] = []
+        var seen = Set<String>()
+        for row in browse.rows where parentPath(row.path) == directory {
+            if !seen.insert(row.path).inserted { continue }
+            rows.append(row)
+        }
+        for folder in browse.folders where parentPath(folder) == directory && !seen.contains(folder) {
+            seen.insert(folder)
+            rows.append(BrowserRow(path: folder, kind: "dir", change: "same", size: 0, newBytes: 0, chunkCount: 0))
+        }
+        return FileTree.sorted(rows)
+    }
+
+    private static func pathTouches(_ directory: String, _ path: String) -> Bool {
+        if directory.isEmpty { return !path.contains("/") }
+        if path == directory || parentPath(path) == directory { return true }
+        return directory.hasPrefix(path + "/")
+    }
+
+    private static func accessForDirectory(
+        _ vault: URL,
+        root: String,
+        directory: String,
+        skipped: [String]
+    ) throws -> (carried: Set<String>, unread: [String]) {
+        let skip = Set((try? config(vault).skipNames) ?? VaultConfig.defaultSkip)
+        var carried = Set<String>()
+        var unread: [String] = []
+        for path in skipped {
+            if RelPath.isExcluded(path, names: skip) { continue }
+            if !pathTouches(directory, path) { continue }
+            if try nodeExists(vault, root, path) {
+                carried.insert(path)
+            } else {
+                unread.append(path)
+            }
+        }
+        return (carried, unread)
+    }
+
+    private static func parentNodes(
+        _ vault: URL,
+        directory: String,
+        parent: CheapParent,
+        comparable: Bool
+    ) throws -> [String: TreeNode] {
+        guard comparable else { return [:] }
+        if let root = parent.root, let hash = directoryHash(vault, root: root, path: directory) {
+            var map: [String: TreeNode] = [:]
+            for node in try readNodes(vault, hash) where map[node.name] == nil {
+                map[node.name] = node
+            }
+            return map
+        }
+        guard let entries = parent.entries else { return [:] }
+        var map: [String: TreeNode] = [:]
+        for entry in entries where parentPath(entry.path) == directory {
+            let name = leafName(entry.path)
+            if name.isEmpty || map[name] != nil { continue }
+            map[name] = node(from: entry)
+        }
+        return map
+    }
+
+    private static func removedDirectory(
+        _ vault: URL,
+        directory: String,
+        parent: CheapParent
+    ) throws -> [BrowserRow] {
+        if let root = parent.root, let hash = directoryHash(vault, root: root, path: directory) {
+            return try removedRows(prefix: directory, nodes: readNodes(vault, hash))
+        }
+        guard let entries = parent.entries else { return [] }
+        return try removedRows(prefix: directory, nodes: entries.filter { parentPath($0.path) == directory }.map(node(from:)))
+    }
+
+    private static func removedRows(prefix: String, nodes: [TreeNode]) throws -> [BrowserRow] {
+        var rows: [BrowserRow] = []
+        var seen = Set<String>()
+        for node in nodes {
+            if node.name.isEmpty || !seen.insert(node.name).inserted { continue }
+            let path = prefix.isEmpty ? node.name : prefix + "/" + node.name
+            guard RelPath.isSafe(path) else {
+                throw ChronicleError.fail("Refusing a path that leaves the folder.")
+            }
+            rows.append(removedRow(path: path, node: node))
+        }
+        return rows
+    }
+
+    private static func removedRow(path: String, node: TreeNode) -> BrowserRow {
+        BrowserRow(
+            path: path,
+            kind: node.kind == "dir" || node.kind == "link" ? node.kind : "file",
+            change: "removed",
+            size: node.kind == "dir" ? 0 : (node.size ?? 0),
+            newBytes: 0,
+            chunkCount: node.chunks?.count ?? 0
+        )
+    }
+
+    private static func node(from entry: Entry) -> TreeNode {
+        let name = leafName(entry.path)
+        if entry.kind == "dir" {
+            return TreeNode(
+                name: name, kind: "dir", mode: entry.mode, mtimeNS: entry.mtimeNS,
+                size: nil, chunks: nil, lengths: nil, target: nil, tree: nil
+            )
+        }
+        if entry.kind == "link" {
+            return TreeNode(
+                name: name, kind: "link", mode: entry.mode, mtimeNS: entry.mtimeNS,
+                size: entry.size, chunks: nil, lengths: nil, target: entry.target ?? "", tree: nil
+            )
+        }
+        return TreeNode(
+            name: name, kind: "file", mode: entry.mode, mtimeNS: entry.mtimeNS,
+            size: entry.size, chunks: entry.chunks, lengths: entry.lengths, target: nil, tree: nil
+        )
+    }
+
+    /// One directory. An unchanged folder stays, with change "same", and its contents are not read.
+    private static func rowsForDirectory(
+        vault: URL,
+        directory: String,
+        nodes: [TreeNode],
+        parentNodes: [String: TreeNode],
+        comparable: Bool,
+        carried: Set<String>,
+        unread: [String]
+    ) throws -> [BrowserRow] {
+        var rows: [BrowserRow] = []
+        var names = Set<String>()
+        var seen = Set<String>()
+        for node in nodes {
+            if node.name.isEmpty || !names.insert(node.name).inserted { continue }
+            let path = directory.isEmpty ? node.name : directory + "/" + node.name
+            guard RelPath.isSafe(path) else {
+                throw ChronicleError.fail("Refusing a path that leaves the folder.")
+            }
+            if !seen.insert(path).inserted { continue }
+            let old = comparable ? parentNodes[node.name] : nil
+            if node.kind == "dir" {
+                let hasFiles: Bool
+                if carried.contains(path), let child = node.tree {
+                    hasFiles = (try? readNodes(vault, child))?.contains { $0.kind == "file" || $0.kind == "link" } ?? true
+                } else {
+                    hasFiles = true
+                }
+                let change = directoryChange(
+                    path: path, node: node, old: old, comparable: comparable, carried: carried, hasFiles: hasFiles
+                ) ?? "same"
+                rows.append(BrowserRow(path: path, kind: "dir", change: change, size: 0, newBytes: 0, chunkCount: 0))
+                continue
+            }
+            rows.append(fileRow(path: path, node: node, old: old, comparable: comparable, carried: carried))
+        }
+        if comparable {
+            for (name, node) in parentNodes where !names.contains(name) {
+                let path = directory.isEmpty ? name : directory + "/" + name
+                if seen.contains(path) || !RelPath.isSafe(path) { continue }
+                seen.insert(path)
+                rows.append(removedRow(path: path, node: node))
+            }
+        }
+        for path in unread where parentPath(path) == directory && !seen.contains(path) && RelPath.isSafe(path) {
+            seen.insert(path)
+            rows.append(BrowserRow(path: path, kind: "file", change: "unread", size: 0, newBytes: 0, chunkCount: 0))
+        }
+        return rows
     }
 
     private enum BrowseParent {
@@ -2374,7 +2943,7 @@ enum Vault {
                 }
                 return
             }
-            if skip.contains(name) || absolute == vaultPath || absolute.hasPrefix(vaultPath + "/") {
+            if leavesOut(name, parent: parentRelative) || absolute == vaultPath || absolute.hasPrefix(vaultPath + "/") {
                 noteSkip(relative, stored: false, covered: false)
                 return
             }
@@ -2700,6 +3269,13 @@ enum Vault {
         func join(_ parent: String, _ name: String) -> String {
             parent.isEmpty ? name : parent + "/" + name
         }
+
+        /// A checked folder is that top-level folder. A usual name is left out at any depth.
+        func leavesOut(_ name: String, parent: String) -> Bool {
+            guard skip.contains(name) else { return false }
+            if parent.isEmpty { return true }
+            return VaultConfig.defaultSkip.contains(name)
+        }
     }
 
 
@@ -2971,7 +3547,128 @@ enum Vault {
         return nil
     }
 
+    /// Logical size of regular files under `url`. Directories are not added, and a symlink is
+    /// not followed. The walk stops between each directory and each batch while a folder is open.
+    /// A volume that cannot list this way is counted with FileManager instead.
     private static func directoryBytes(_ url: URL) -> Int64 {
+        pauseForFolderRead()
+        if let counted = bulkDirectoryBytes(url.path) {
+            return counted
+        }
+        return enumeratedDirectoryBytes(url)
+    }
+
+    private enum BulkDirectory {
+        case absent
+        case unsupported
+        case counted(Int64, [String])
+    }
+
+    /// Nil means the root could not be listed this way. The caller uses FileManager.
+    private static func bulkDirectoryBytes(_ root: String) -> Int64? {
+        var total: Int64 = 0
+        var pending = [root]
+        while let path = pending.popLast() {
+            pauseForFolderRead()
+            switch bulkScan(path) {
+            case .absent:
+                continue
+            case .unsupported:
+                if path == root { return nil }
+                total += enumeratedDirectoryBytes(URL(fileURLWithPath: path))
+            case .counted(let bytes, let children):
+                total += bytes
+                pending.append(contentsOf: children)
+            }
+        }
+        return total
+    }
+
+    private static func bulkScan(_ path: String) -> BulkDirectory {
+        let fd = open(path, O_RDONLY | O_DIRECTORY)
+        if fd < 0 { return .absent }
+        defer { close(fd) }
+        var list = attrlist(
+            bitmapcount: u_short(ATTR_BIT_MAP_COUNT),
+            reserved: 0,
+            commonattr: attrgroup_t(ATTR_CMN_RETURNED_ATTRS)
+                | attrgroup_t(ATTR_CMN_NAME)
+                | attrgroup_t(ATTR_CMN_OBJTYPE)
+                | attrgroup_t(ATTR_CMN_ERROR),
+            volattr: 0,
+            dirattr: 0,
+            fileattr: attrgroup_t(ATTR_FILE_DATALENGTH),
+            forkattr: 0
+        )
+        let capacity = 64 * 1024
+        var buffer = [UInt8](repeating: 0, count: capacity)
+        var total: Int64 = 0
+        var children: [String] = []
+        while true {
+            pauseForFolderRead()
+            let count = buffer.withUnsafeMutableBytes { raw -> Int32 in
+                guard let base = raw.baseAddress else { return -1 }
+                return getattrlistbulk(fd, &list, base, capacity, 0)
+            }
+            if count < 0 { return .unsupported }
+            if count == 0 { break }
+            var offset = 0
+            for _ in 0..<count {
+                guard offset + 4 <= buffer.count else { break }
+                let length = Int(buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) })
+                guard length >= 4, offset + length <= buffer.count else { break }
+                if let item = bulkItem(buffer, start: offset, length: length) {
+                    // VREG is 1. VDIR is 2. Anything else, including a symlink, is skipped.
+                    if item.type == 2 {
+                        children.append(path + "/" + item.name)
+                    } else if item.type == 1 {
+                        total += item.size
+                    }
+                }
+                offset += length
+            }
+        }
+        return .counted(total, children)
+    }
+
+    /// One `getattrlistbulk` record. The data-fork length is 4-byte aligned here, not 8.
+    private static func bulkItem(_ buffer: [UInt8], start: Int, length: Int) -> (name: String, type: UInt32, size: Int64)? {
+        var cursor = start + 4
+        func read<T>(_ type: T.Type) -> T? {
+            let size = MemoryLayout<T>.size
+            let aligned = (cursor + 3) & ~3
+            guard aligned + size <= start + length else { return nil }
+            cursor = aligned + size
+            return buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: aligned, as: T.self) }
+        }
+        guard let returned = read(attribute_set_t.self) else { return nil }
+        var name = ""
+        if returned.commonattr & attrgroup_t(ATTR_CMN_NAME) != 0 {
+            guard let ref = read(attrreference_t.self) else { return nil }
+            let refPos = cursor - MemoryLayout<attrreference_t>.size
+            let nameAt = refPos + Int(ref.attr_dataoffset)
+            let nameLen = Int(ref.attr_length)
+            guard nameLen > 1, nameAt >= start, nameAt + nameLen <= start + length else { return nil }
+            name = String(decoding: buffer[nameAt..<(nameAt + nameLen - 1)], as: UTF8.self)
+        }
+        var type: UInt32 = 0
+        if returned.commonattr & attrgroup_t(ATTR_CMN_OBJTYPE) != 0 {
+            guard let value = read(UInt32.self) else { return nil }
+            type = value
+        }
+        if returned.commonattr & attrgroup_t(ATTR_CMN_ERROR) != 0 {
+            guard read(UInt32.self) != nil else { return nil }
+        }
+        var size: Int64 = 0
+        if returned.fileattr & attrgroup_t(ATTR_FILE_DATALENGTH) != 0 {
+            guard let value = read(Int64.self) else { return nil }
+            size = value
+        }
+        if name.isEmpty || name == "." || name == ".." { return nil }
+        return (name, type, size)
+    }
+
+    private static func enumeratedDirectoryBytes(_ url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
             at: url,
             includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
@@ -2979,6 +3676,7 @@ enum Vault {
         ) else { return 0 }
         var total: Int64 = 0
         for case let file as URL in enumerator {
+            pauseForFolderRead()
             let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             if values?.isRegularFile == true {
                 total += Int64(values?.fileSize ?? 0)

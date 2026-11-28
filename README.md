@@ -4,17 +4,17 @@ A personal time machine for one folder at a time. Chronicle watches the folder a
 
 The cost of a full copy, times the number of versions, is what history usually costs. Chronicle keeps the new bytes.
 
-**Version:** 1.0.28 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
+**Version:** 1.0.33 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
 
 ## What you see
 
-Add a folder. Chronicle lists the folders directly inside it, including names that start with a dot, and you leave out the ones you check before the first snapshot. After that, the header is the product:
+Add a folder. Chronicle lists the folders directly inside it, including names that start with a dot, and you leave out the ones you check before the first snapshot. A checked folder is only that folder. The same name deeper inside is kept. After that, the header is the product:
 
 - **Stored** is the history on disk.
 - **Full copies** is what the same versions would weigh if each one were a complete copy.
 - **Saved** is the difference, as a percent.
 
-A version row says how many new bytes it stored, and how large a full copy of the folder would have been. Pick a version to see its folders. Open a folder to find the files inside it, including a folder that did not change. A file that was added, changed, or removed is marked, and a changed file shows how much of it is actually new. A file whose only change is its permissions is shown as changed.
+A version row says how many new bytes it stored, and how large a full copy of the folder would have been. Pick a version to see its top folder. Open a folder to read the files inside it, including a folder that did not change. Opening a version reads that top folder first, reads a folder inside it only when you open it, and that read is not held up while Chronicle counts every stored file or thins the history. The header shows the full-copy size as soon as those versions are listed, and fills in stored and saved when the count of files on disk finishes. Reopening Chronicle reads each version header once, and reloads that list after launch maintenance only when a version was removed. A file that was added, changed, or removed is marked, and a changed file shows how much of it is actually new. A file whose only change is its permissions is shown as changed.
 
 Snapshot (⌘S) writes a version now. It walks one folder at a time and does not keep every file's chunk list in memory. Stop Snapshot (⌘.) ends that snapshot before the version is saved. A second request while one is running waits its turn. Re-read Every File (⌥⌘S) reads every byte, including files whose size and modification time did not change. Restore writes a new folder somewhere else, one file, or one folder from the version and the files inside it. Restore Folder lists every folder in that version, including ones the file list hides, then asks where to write that folder. The place is chosen only after the list has closed. Approving a replace writes that file beside the one already there and puts it in place only after every chunk has been read. A damaged chunk leaves the original file where it is. Delete Version drops that manifest and the chunks no other version uses.
 
@@ -52,7 +52,7 @@ Verify History reads every version file, including one whose index is missing, t
 
 For each file: relative path, kind, permission bits, modification time, size, and the chunk list. Symlinks store the target and are not followed. Empty directories are kept.
 
-Skipped anywhere in the tree: `.DS_Store`, `.localized`, `.git`, `.build`, `.swiftpm`, `DerivedData`, `node_modules`. The list is written into the vault. Add Folder can leave out another folder, such as `.SynologyWorkingDirectory`, before that first snapshot. The same name is left out wherever it appears. A skipped file is left out by itself. A skipped directory is left out with everything inside it. A symlink is stored and is not followed, and it does not hide the next folder.
+Skipped anywhere in the tree: `.DS_Store`, `.localized`, `.git`, `.build`, `.swiftpm`, `DerivedData`, `node_modules`. The list is written into the vault. Add Folder can leave out another top-level folder, such as `Cache` or `.SynologyWorkingDirectory`, before that first snapshot. That check does not leave out a deeper folder with the same name. A skipped file is left out by itself. A skipped directory is left out with everything inside it. A symlink is stored and is not followed, and it does not hide the next folder.
 
 Resource forks, Finder tags, ACLs, and file owners are not stored. Hard links become separate files that share chunks when the bytes match. A socket, device, or unreadable file is listed as skipped. An unreadable file that was in the previous version keeps that previous copy.
 

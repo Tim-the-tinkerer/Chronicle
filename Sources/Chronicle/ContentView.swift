@@ -5,9 +5,8 @@ struct ContentView: View {
     /// Day ids the user has opened. The newest day is not in here; it stays open.
     @State private var expandedDays: Set<String> = []
     @State private var thinningOpen = false
-    /// Folders the user has opened in the version tree. A filter opens every folder it still shows.
+    /// Folders the user has opened in the version tree. A filter does not write this.
     @State private var openFolders: Set<String> = []
-    @State private var shownTree: [FileTree.Node] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,7 +35,16 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 18) {
+        let copies = model.totals?.rawCopyBytes
+            ?? model.summaries.reduce(Int64(0)) { $0 + $1.stats.logicalBytes }
+        let stored = model.totals.map { ByteText.string($0.storedBytes) } ?? "…"
+        let saved: String
+        if let totals = model.totals {
+            saved = totals.savedPercent.map { "\($0)%" } ?? "—"
+        } else {
+            saved = "…"
+        }
+        return HStack(alignment: .center, spacing: 18) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Chronicle")
                     .font(.system(size: 22, weight: .semibold))
@@ -46,10 +54,10 @@ struct ContentView: View {
                     .foregroundStyle(Theme.muted)
             }
             Spacer()
-            if let totals = model.totals, totals.snapshotCount > 0 {
-                stat("Stored", ByteText.string(totals.storedBytes))
-                stat("Full copies", ByteText.string(totals.rawCopyBytes))
-                stat("Saved", totals.savedPercent.map { "\($0)%" } ?? "—")
+            if !model.summaries.isEmpty {
+                stat("Stored", stored)
+                stat("Full copies", ByteText.string(copies))
+                stat("Saved", saved)
             }
         }
         .padding(.horizontal, 18)
@@ -201,7 +209,7 @@ struct ContentView: View {
                     if let day = versionDays.first(where: { !$0.opensFlat && $0.heads.contains { $0.id == id } }) {
                         expandedDays.insert(day.id)
                     }
-                    model.loadRows(id)
+                    model.loadRoot(id)
                 }
             }
             hairline
@@ -238,11 +246,21 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             List(selection: $model.selectedPath) {
-                VersionTree(
-                    nodes: shownTree,
-                    openFolders: $openFolders,
-                    filtering: !model.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
+                if filtering {
+                    if model.searching {
+                        Text("Searching…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.muted)
+                    } else {
+                        SearchTree(nodes: model.searchTree)
+                    }
+                } else if model.listing && model.rootEntries.isEmpty {
+                    Text("Reading…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.muted)
+                } else {
+                    VersionTree(rows: model.rootEntries, model: model, openFolders: $openFolders)
+                }
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
@@ -250,14 +268,11 @@ struct ContentView: View {
             restoreBar
         }
         .background(Theme.bg)
-        .onAppear { rebuildTree() }
-        .onChange(of: model.rows) { _ in rebuildTree() }
-        .onChange(of: model.folderPaths) { _ in rebuildTree() }
-        .onChange(of: model.filter) { _ in rebuildTree() }
+        .onChange(of: model.filter) { _ in model.scheduleSearch() }
     }
 
-    private func rebuildTree() {
-        shownTree = FileTree.make(rows: model.rows, folders: model.folderPaths, query: model.filter)
+    private var filtering: Bool {
+        !model.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var detail: some View {
@@ -268,7 +283,7 @@ struct ContentView: View {
                     .foregroundStyle(Theme.muted)
                     .lineLimit(1)
                     .truncationMode(.middle)
-            } else if let path = model.selectedPath, model.folderPaths.contains(path) {
+            } else if let path = model.folderDetailPath() {
                 Text("\(path)  ·  folder")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.muted)
@@ -520,6 +535,13 @@ struct ContentView: View {
         return "\(row.path)  ·  \(Self.word(row.change))  ·  \(row.chunkCount) chunks  ·  \(ByteText.string(row.newBytes)) new since the previous version"
     }
 
+    /// A folder that did not change has no SAME badge. A file that did not change still does.
+    private static func badgeText(_ row: BrowserRow?) -> String {
+        guard let row else { return "" }
+        if row.kind == "dir" && row.change == "same" { return "" }
+        return badge(row.change)
+    }
+
     private static func badge(_ change: String) -> String {
         switch change {
         case "added": return "ADDED"
@@ -551,32 +573,70 @@ struct ContentView: View {
         }
     }
 
-    private struct VersionTree: View {
-        let nodes: [FileTree.Node]
-        @Binding var openFolders: Set<String>
-        let filtering: Bool
+    private struct EntryLabel: View {
+        let name: String
+        let row: BrowserRow?
+        let folder: Bool
 
         var body: some View {
-            ForEach(nodes) { node in
-                if let children = node.children {
-                    DisclosureGroup(isExpanded: expanded(node.path)) {
-                        VersionTree(nodes: children, openFolders: $openFolders, filtering: filtering)
+            HStack(spacing: 8) {
+                Text(ContentView.badgeText(row))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(row.map { ContentView.color($0.change) } ?? Theme.muted)
+                    .frame(width: 58, alignment: .leading)
+                Text(name)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text(trailing)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+
+        private var trailing: String {
+            if folder { return row?.change == "removed" ? "gone" : "folder" }
+            if row?.change == "removed" { return "gone" }
+            return ByteText.string(row?.size ?? 0)
+        }
+    }
+
+    /// One directory. Opening a folder reads that folder and nothing under it.
+    private struct VersionTree: View {
+        let rows: [BrowserRow]
+        @ObservedObject var model: AppModel
+        @Binding var openFolders: Set<String>
+
+        var body: some View {
+            ForEach(rows) { row in
+                if row.kind == "dir" {
+                    DisclosureGroup(isExpanded: expanded(row.path)) {
+                        if let children = model.childEntries[row.path] {
+                            VersionTree(rows: children, model: model, openFolders: $openFolders)
+                        } else {
+                            Text("Reading…")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.muted)
+                                .onAppear { model.ensureDirectory(row.path) }
+                        }
                     } label: {
-                        label(node).tag(node.path)
+                        EntryLabel(name: leaf(row.path), row: row, folder: true).tag(row.path)
                     }
                 } else {
-                    label(node).tag(node.path)
+                    EntryLabel(name: leaf(row.path), row: row, folder: false).tag(row.path)
                 }
             }
         }
 
         private func expanded(_ path: String) -> Binding<Bool> {
             Binding(
-                get: { filtering || openFolders.contains(path) },
+                get: { openFolders.contains(path) },
                 set: { open in
-                    if filtering { return }
                     if open {
                         openFolders.insert(path)
+                        model.ensureDirectory(path)
                     } else {
                         openFolders.remove(path)
                     }
@@ -584,30 +644,28 @@ struct ContentView: View {
             )
         }
 
-        private func label(_ node: FileTree.Node) -> some View {
-            HStack(spacing: 8) {
-                Text(node.row.map { ContentView.badge($0.change) } ?? "")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(node.row.map { ContentView.color($0.change) } ?? Theme.muted)
-                    .frame(width: 58, alignment: .leading)
-                Text(node.name)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                Text(trailing(node))
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Theme.muted)
-            }
+        private func leaf(_ path: String) -> String {
+            guard let slash = path.lastIndex(of: "/") else { return path }
+            return String(path[path.index(after: slash)...])
         }
+    }
 
-        private func trailing(_ node: FileTree.Node) -> String {
-            if node.children != nil {
-                return node.row?.change == "removed" ? "gone" : "folder"
+    /// Search results stay open. They are already the matches, so folders are not read one by one.
+    private struct SearchTree: View {
+        let nodes: [FileTree.Node]
+
+        var body: some View {
+            ForEach(nodes) { node in
+                if let children = node.children {
+                    DisclosureGroup(isExpanded: .constant(true)) {
+                        SearchTree(nodes: children)
+                    } label: {
+                        EntryLabel(name: node.name, row: node.row, folder: true).tag(node.path)
+                    }
+                } else {
+                    EntryLabel(name: node.name, row: node.row, folder: false).tag(node.path)
+                }
             }
-            if node.row?.change == "removed" { return "gone" }
-            return ByteText.string(node.row?.size ?? 0)
         }
     }
 

@@ -376,8 +376,22 @@ enum RestoreTarget {
 }
 
 enum RelPath {
+    /// A usual name is left out wherever it appears. A name added in Add Folder
+    /// is only the top-level folder that was checked.
     static func isExcluded(_ path: String, names: Set<String>) -> Bool {
-        path.split(separator: "/").contains { names.contains(String($0)) }
+        let parts = path.split(separator: "/")
+        guard let first = parts.first else { return false }
+        let top = String(first)
+        if names.contains(top) && !VaultConfig.defaultSkip.contains(top) {
+            return true
+        }
+        for part in parts {
+            let name = String(part)
+            if names.contains(name) && VaultConfig.defaultSkip.contains(name) {
+                return true
+            }
+        }
+        return false
     }
 
     static func isSafe(_ path: String) -> Bool {
@@ -858,7 +872,7 @@ struct VaultConfig: Codable, Equatable {
     ]
 }
 
-struct VaultTotals: Equatable {
+struct VaultTotals: Codable, Equatable {
     var snapshotCount: Int
     var storedBytes: Int64
     var chunkBytes: Int64
@@ -986,6 +1000,17 @@ enum FileTree {
         }
 
         return (children[""] ?? []).sorted(by: ordered).map(node)
+    }
+
+    /// Folders first, then the file name, so one directory is easy to scan.
+    static func sorted(_ rows: [BrowserRow]) -> [BrowserRow] {
+        rows.sorted { lhs, rhs in
+            let lhsDir = lhs.kind == "dir"
+            if lhsDir != (rhs.kind == "dir") { return lhsDir }
+            let compared = leaf(lhs.path).localizedStandardCompare(leaf(rhs.path))
+            if compared == .orderedSame { return lhs.path < rhs.path }
+            return compared == .orderedAscending
+        }
     }
 
     private static func leaf(_ path: String) -> String {

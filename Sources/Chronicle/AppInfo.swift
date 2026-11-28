@@ -2,8 +2,8 @@ import Foundation
 
 enum AppInfo {
     static let name = "Chronicle"
-    static let version = "1.0.28"
-    static let build = "29"
+    static let version = "1.0.33"
+    static let build = "34"
     static let bundleID = "com.tim.chronicle"
     static let format = "CHRONICLE/1"
     static let tagline = "A personal time machine"

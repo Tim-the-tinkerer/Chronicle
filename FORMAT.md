@@ -39,7 +39,7 @@ Optional. Absent until thinning removes a version. Not required to restore.
 
 Chunk parameters are fixed for the life of the vault. A later snapshot uses the stored parameters, so identical bytes keep the same cuts.
 
-A name on `skipNames` is omitted. When that name is a directory, its contents are omitted too. A skipped file is omitted alone and does not hide the rest of its folder. Symlinks are stored as the link text and are not followed. Add Folder can add names before the first snapshot. A later snapshot uses the stored list.
+A usual name on `skipNames` is omitted wherever it appears. A name Add Folder adds is only that top-level folder. When the omitted name is a directory, its contents are omitted too. A skipped file is omitted alone and does not hide the rest of its folder. Symlinks are stored as the link text and are not followed. A later snapshot uses the stored list.
 
 ## Snapshot
 

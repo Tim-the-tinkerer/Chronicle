@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.33
+
+- Reopening Chronicle reads each version header once. Launch maintenance reloads the version list only when it removed a version.
+
+## 1.0.32
+
+- The header shows the full-copy size as soon as the versions are listed. Stored and saved fill in when the count finishes, and opening a folder goes ahead of that count.
+
+## 1.0.31
+
+- A snapshot's files and folders show before Chronicle counts every stored file or thins the history. Opening another snapshot or folder goes ahead of that walk.
+
+## 1.0.30
+
+- A folder you check in Add Folder is only that top-level folder. A deeper folder with the same name, such as `Projects/Cache`, is still kept. The usual names are still left out wherever they appear.
+
+## 1.0.29
+
+- Opening a large version shows its top folder first. A folder inside it is read when you open it, and counting the stored size no longer holds that up.
+
 ## 1.0.28
 
 - A version's files are shown as a folder tree. Open a folder to see what is inside it. The filter still finds a file by name.

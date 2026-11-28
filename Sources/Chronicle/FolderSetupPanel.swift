@@ -54,7 +54,7 @@ final class FolderSetupPanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         guard let content = window.contentView else { return }
         let text = unreadable
             ? "Chronicle could not list the folders here. The usual names will still be left out. The first snapshot starts when you continue."
-            : "These are the folders directly inside this one, including names that start with a dot. Check one to leave it out. Chronicle will not read it, or another folder with the same name. The usual names stay left out unless you clear that folder."
+            : "These are the folders directly inside this one, including names that start with a dot. Check one to leave that folder out. A folder with the same name deeper inside is still kept. The usual names stay left out wherever they appear, unless you clear that folder."
         let message = NSTextField(wrappingLabelWithString: text)
         message.font = .systemFont(ofSize: 12)
         message.textColor = .secondaryLabelColor

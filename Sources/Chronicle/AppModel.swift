@@ -33,8 +33,16 @@ final class AppModel: ObservableObject {
     /// New-byte figures for the version list. A missing parent file is measured once.
     @Published var glances: [String: VersionGlance] = [:]
     @Published var selectedSnapshotID: String?
-    @Published var rows: [BrowserRow] = []
-    /// Folders recorded in the selected version, including ones the file list hides.
+    /// The top of the selected version. Opening a folder fills `childEntries`.
+    @Published var rootEntries: [BrowserRow] = []
+    /// One opened folder's names. The key is absent until that folder has been read.
+    @Published var childEntries: [String: [BrowserRow]] = [:]
+    /// True while the top of the selected version is being read.
+    @Published var listing = false
+    /// Matches for the filter. Empty until a search finishes.
+    @Published var searchTree: [FileTree.Node] = []
+    @Published var searching = false
+    /// Folders recorded in the selected version. Filled when Restore Folder is used.
     @Published var folderPaths: [String] = []
     @Published var filter = ""
     @Published var selectedPath: String?
@@ -54,6 +62,10 @@ final class AppModel: ObservableObject {
     @Published var thinningReadable = true
 
     private let work = DispatchQueue(label: "com.tim.chronicle.work", qos: .userInitiated)
+    /// Version browsing stays off the snapshot queue, so a launch check does not hold the file list.
+    private let browse = DispatchQueue(label: "com.tim.chronicle.browse", qos: .userInitiated)
+    /// Counting every stored chunk stays off the file list, and starts after that list is visible.
+    private let totalsQueue = DispatchQueue(label: "com.tim.chronicle.totals", qos: .utility)
     private let watch = FolderWatch()
     private var timer: Timer?
     private var working = false
@@ -78,9 +90,22 @@ final class AppModel: ObservableObject {
     private var refreshPending = false
     /// The folder whose versions are on screen. A switch clears that list immediately.
     private var shownLibrary: String?
-    /// True once the selected version's folder list has been read, even when it is empty.
+    /// True once Restore Folder has read this version's folder list, even when it is empty.
     private var foldersReady = false
     private var folderSnapshotID: String?
+    /// Folders whose read is already running. A second open does not start another.
+    private var loadingDirs = Set<String>()
+    private var loadingFolders = false
+    private var listingRoot = false
+    /// Set when a version's top directory was read, including when that directory is empty.
+    private var rootReadyID: String?
+    private var rootTicket = 0
+    private var searchTicket = 0
+    private var searchTimer: Timer?
+    /// Launch thinning and catch-up run once the selected version's top folder is visible.
+    private var launchPassPending = false
+    /// Vault paths whose stored-byte count is already queued. One walk at a time per vault.
+    private var totalsInFlight = Set<String>()
 
     var selectedLibrary: Library? {
         libraries.first { $0.id == selection }
@@ -91,7 +116,20 @@ final class AppModel: ObservableObject {
     }
 
     var selectedRow: BrowserRow? {
-        rows.first { $0.path == selectedPath }
+        guard let path = selectedPath else { return nil }
+        if let row = rootEntries.first(where: { $0.path == path }) { return row }
+        for children in childEntries.values {
+            if let row = children.first(where: { $0.path == path }) { return row }
+        }
+        return searchRow(path)
+    }
+
+    /// A selected folder that has no file row yet. Restore Folder still uses the folder list.
+    func folderDetailPath() -> String? {
+        guard selectedRow == nil, let path = selectedPath, !path.isEmpty else { return nil }
+        if folderPaths.contains(path) { return path }
+        if searchTreeHasFolder(path) { return path }
+        return nil
     }
 
     var idleLine: String {
@@ -136,6 +174,7 @@ final class AppModel: ObservableObject {
             return
         }
         started = true
+        launchPassPending = true
         loadLibraries()
         if selection == nil {
             selection = UserDefaults.standard.string(forKey: defaultsKey)
@@ -152,29 +191,6 @@ final class AppModel: ObservableObject {
             self?.tick()
         }
         refresh()
-        // heal reads the vault. On a sleeping external drive that has to stay off the main thread.
-        // It also thins old versions, so the list is loaded again after that finishes.
-        let vaults = libraries.map { (name: $0.name, vault: $0.vault) }
-        let nameEach = vaults.count > 1
-        work.async {
-            var thinned: [(name: String, result: PruneResult)] = []
-            for item in vaults {
-                let vault = URL(fileURLWithPath: item.vault)
-                guard FileManager.default.fileExists(atPath: vault.path) else { continue }
-                let result = (try? Vault.heal(vault)) ?? .none
-                if result.count > 0 {
-                    thinned.append((item.name, result))
-                }
-            }
-            DispatchQueue.main.async {
-                if !thinned.isEmpty {
-                    self.thinNote = ThinText.report(thinned, nameEach: nameEach)
-                    self.banner = self.thinNote
-                }
-                self.refresh()
-                self.catchUp()
-            }
-        }
     }
 
     /// Edits made while the app was closed never produced a filesystem event.
@@ -431,7 +447,6 @@ final class AppModel: ObservableObject {
                 )
                 let heads = try Vault.listHeads(vault)
                 let shown = Vault.rowGlances(vault: vault, heads: heads)
-                let totals = try Vault.totals(vault)
                 let skip = (try? Vault.config(vault).skipNames.joined(separator: ", ")) ?? VaultConfig.defaultSkip.joined(separator: ", ")
                 DispatchQueue.main.async {
                     // finishWork clears the flag. Read it first, or a late stop looks like a normal save.
@@ -450,19 +465,18 @@ final class AppModel: ObservableObject {
                         self.shownLibrary = id
                         self.summaries = heads
                         self.glances = shown
-                        self.totals = totals
                         self.latestDate = heads.first.flatMap { TimeText.parse($0.created) }
                         self.skipLine = skip
+                        self.loadTotals(vault: vault, libraryID: id)
                         if stampLabel { self.labelText = "" }
                         if let snap {
-                            self.loadRows(snap.id)
+                            self.loadRoot(snap.id)
                         } else if let current = self.selectedSnapshotID, heads.contains(where: { $0.id == current }) {
-                            self.loadRows(current)
+                            self.loadRoot(current)
                         } else if let first = heads.first {
-                            self.loadRows(first.id)
+                            self.loadRoot(first.id)
                         } else {
-                            self.rows = []
-                            self.dropFolderList()
+                            self.clearBrowser()
                             self.selectedSnapshotID = nil
                         }
                     }
@@ -542,15 +556,14 @@ final class AppModel: ObservableObject {
             shownLibrary = nil
             summaries = []
             glances = [:]
-            rows = []
-            dropFolderList()
+            clearBrowser()
             selectedSnapshotID = nil
-            selectedPath = nil
             totals = nil
             latestDate = nil
             skipLine = ""
             thinningLog = .empty
             thinningReadable = true
+            noteBrowserReady()
             return
         }
         // The previous folder's versions stay in `summaries` until this returns.
@@ -559,10 +572,8 @@ final class AppModel: ObservableObject {
             shownLibrary = library.id
             summaries = []
             glances = [:]
-            rows = []
-            dropFolderList()
+            clearBrowser()
             selectedSnapshotID = nil
-            selectedPath = nil
             totals = nil
             latestDate = nil
             thinningLog = .empty
@@ -577,24 +588,25 @@ final class AppModel: ObservableObject {
             listEpoch += 1
             summaries = []
             glances = [:]
-            rows = []
-            dropFolderList()
+            clearBrowser()
             selectedSnapshotID = nil
-            selectedPath = nil
             totals = nil
             latestDate = nil
             skipLine = VaultConfig.defaultSkip.joined(separator: ", ")
             thinningLog = .empty
             thinningReadable = true
+            noteBrowserReady()
             return
+        }
+        if totals == nil, let cached = TotalsMemory.read(vault.path) {
+            totals = cached
         }
         listEpoch += 1
         let epoch = listEpoch
         let libraryID = library.id
         work.async {
             let heads = (try? Vault.listHeads(vault)) ?? []
-            let shown = Vault.rowGlances(vault: vault, heads: heads)
-            let totals = try? Vault.totals(vault)
+            let shown = Vault.storedGlances(heads)
             let skip = (try? Vault.config(vault).skipNames.joined(separator: ", ")) ?? VaultConfig.defaultSkip.joined(separator: ", ")
             let history = Vault.thinningHistory(vault)
             DispatchQueue.main.async {
@@ -602,57 +614,119 @@ final class AppModel: ObservableObject {
                 self.shownLibrary = libraryID
                 self.summaries = heads
                 self.glances = shown
-                self.totals = totals
                 self.latestDate = heads.first.flatMap { TimeText.parse($0.created) }
                 self.skipLine = skip
                 self.thinningLog = history.log
                 self.thinningReadable = history.readable
                 if let current = self.selectedSnapshotID, heads.contains(where: { $0.id == current }) {
-                    self.loadRows(current)
+                    self.loadRoot(current)
                 } else if let first = heads.first {
-                    self.loadRows(first.id)
+                    self.loadRoot(first.id)
                 } else {
-                    self.rows = []
-                    self.dropFolderList()
+                    self.clearBrowser()
                     self.selectedSnapshotID = nil
+                    self.noteBrowserReady()
                 }
             }
         }
     }
 
-    func loadRows(_ id: String) {
+    /// The top directory of one version. A folder inside it is read when it is opened.
+    func loadRoot(_ id: String) {
         guard let library = selectedLibrary else { return }
+        if rootReadyID == id {
+            noteBrowserReady()
+            return
+        }
+        if listingRoot && selectedSnapshotID == id { return }
         selectedSnapshotID = id
+        listingRoot = true
+        listing = true
+        rootReadyID = nil
+        rootTicket += 1
+        let ticket = rootTicket
+        rootEntries = []
+        childEntries = [:]
+        loadingDirs.removeAll()
         dropFolderList()
         let libraryID = library.id
         let vault = URL(fileURLWithPath: library.vault)
-        work.async {
-            let listed: VersionBrowse
+        scheduleSearch()
+        browse.async {
+            let listed: [BrowserRow]
             do {
-                listed = try Vault.listVersion(vault, id)
+                listed = try Vault.listDirectory(vault, id, "")
             } catch {
                 DispatchQueue.main.async {
+                    guard ticket == self.rootTicket, self.selection == libraryID, self.selectedSnapshotID == id else { return }
+                    self.listingRoot = false
+                    self.listing = false
+                    self.rootEntries = []
+                    if !self.busy { self.banner = error.localizedDescription }
+                    self.noteBrowserReady()
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                guard ticket == self.rootTicket, self.selection == libraryID, self.selectedSnapshotID == id else { return }
+                self.listingRoot = false
+                self.listing = false
+                self.rootReadyID = id
+                self.rootEntries = listed
+                self.noteBrowserReady()
+            }
+        }
+    }
+
+    /// Reads one folder the user opened. The names already read are kept.
+    func ensureDirectory(_ path: String) {
+        guard !path.isEmpty, let id = selectedSnapshotID, let library = selectedLibrary else { return }
+        if childEntries[path] != nil || loadingDirs.contains(path) { return }
+        loadingDirs.insert(path)
+        let libraryID = library.id
+        let vault = URL(fileURLWithPath: library.vault)
+        browse.async {
+            let listed: [BrowserRow]
+            do {
+                listed = try Vault.listDirectory(vault, id, path)
+            } catch {
+                DispatchQueue.main.async {
+                    self.loadingDirs.remove(path)
                     guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
-                    self.rows = []
-                    self.folderPaths = []
-                    self.folderSnapshotID = id
-                    self.foldersReady = true
+                    var copy = self.childEntries
+                    copy[path] = []
+                    self.childEntries = copy
                     if !self.busy { self.banner = error.localizedDescription }
                 }
                 return
             }
             DispatchQueue.main.async {
+                self.loadingDirs.remove(path)
                 guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
-                self.rows = listed.rows
-                self.folderPaths = listed.folders
-                self.folderSnapshotID = id
-                self.foldersReady = true
-                if let path = self.selectedPath,
-                   !self.rows.contains(where: { $0.path == path }),
-                   !listed.folders.contains(path) {
-                    self.selectedPath = nil
-                }
+                var copy = self.childEntries
+                copy[path] = listed
+                self.childEntries = copy
             }
+        }
+    }
+
+    /// A filter walks the version off the first paint and keeps the matches.
+    func scheduleSearch() {
+        searchTimer?.invalidate()
+        searchTicket += 1
+        let query = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, let id = selectedSnapshotID, let library = selectedLibrary else {
+            searching = false
+            searchTree = []
+            return
+        }
+        searching = true
+        searchTree = []
+        let ticket = searchTicket
+        let libraryID = library.id
+        let vault = URL(fileURLWithPath: library.vault)
+        searchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
+            self?.runSearch(vault: vault, id: id, libraryID: libraryID, query: query, ticket: ticket)
         }
     }
 
@@ -746,10 +820,43 @@ final class AppModel: ObservableObject {
             banner = "Choose a folder in this version."
             return
         }
-        guard foldersReady, folderSnapshotID == id else {
-            banner = "The folder list is still loading."
+        if foldersReady, folderSnapshotID == id {
+            presentDirectoryRestore(library: library, id: id)
             return
         }
+        if loadingFolders { return }
+        loadingFolders = true
+        banner = "Reading folders…"
+        let libraryID = library.id
+        let vault = URL(fileURLWithPath: library.vault)
+        browse.async {
+            let folders: [String]
+            do {
+                folders = try Vault.foldersInVersion(vault, id)
+            } catch {
+                DispatchQueue.main.async {
+                    self.loadingFolders = false
+                    guard self.selection == libraryID, self.selectedSnapshotID == id else { return }
+                    self.banner = error.localizedDescription
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                self.loadingFolders = false
+                guard self.selection == libraryID, self.selectedSnapshotID == id, !self.working else {
+                    if self.working { self.banner = "Chronicle is still finishing the last job." }
+                    return
+                }
+                self.folderPaths = folders
+                self.folderSnapshotID = id
+                self.foldersReady = true
+                if self.banner == "Reading folders…" { self.banner = "" }
+                self.presentDirectoryRestore(library: library, id: id)
+            }
+        }
+    }
+
+    private func presentDirectoryRestore(library: Library, id: String) {
         guard !folderPaths.isEmpty else {
             banner = "This version has no folders. Restore Version writes the whole folder."
             return
@@ -803,6 +910,137 @@ final class AppModel: ObservableObject {
         folderPaths = []
         foldersReady = false
         folderSnapshotID = nil
+    }
+
+    private func clearBrowser() {
+        rootEntries = []
+        childEntries = [:]
+        loadingDirs.removeAll()
+        searchTree = []
+        searching = false
+        searchTicket += 1
+        searchTimer?.invalidate()
+        searchTimer = nil
+        listing = false
+        listingRoot = false
+        rootReadyID = nil
+        rootTicket += 1
+        selectedPath = nil
+        dropFolderList()
+    }
+
+    /// The top folder is visible, or there is nothing to show. Counting files and launch
+    /// thinning start here, so they do not hold that folder back.
+    private func noteBrowserReady() {
+        if let library = selectedLibrary {
+            let vault = URL(fileURLWithPath: library.vault)
+            if FileManager.default.fileExists(atPath: vault.path) {
+                loadTotals(vault: vault, libraryID: library.id)
+            }
+        }
+        guard launchPassPending else { return }
+        launchPassPending = false
+        let vaults = libraries.map { (name: $0.name, vault: $0.vault) }
+        let nameEach = vaults.count > 1
+        work.async {
+            var thinned: [(name: String, result: PruneResult)] = []
+            var recount = false
+            for item in vaults {
+                let vault = URL(fileURLWithPath: item.vault)
+                guard FileManager.default.fileExists(atPath: vault.path) else { continue }
+                let outcome = (try? Vault.healOutcome(vault)) ?? Vault.HealOutcome(pruned: .none, recount: false)
+                if outcome.pruned.count > 0 {
+                    thinned.append((item.name, outcome.pruned))
+                } else if outcome.recount {
+                    recount = true
+                }
+            }
+            let reload = !thinned.isEmpty
+            DispatchQueue.main.async {
+                if !thinned.isEmpty {
+                    self.thinNote = ThinText.report(thinned, nameEach: nameEach)
+                    self.banner = self.thinNote
+                }
+                // The list on screen is already current when nothing was removed.
+                if reload {
+                    self.refresh()
+                } else if recount, let library = self.selectedLibrary {
+                    let vault = URL(fileURLWithPath: library.vault)
+                    if FileManager.default.fileExists(atPath: vault.path) {
+                        self.loadTotals(vault: vault, libraryID: library.id)
+                    }
+                }
+                self.catchUp()
+            }
+        }
+    }
+
+    private func loadTotals(vault: URL, libraryID: String) {
+        let path = vault.path
+        if totalsInFlight.contains(path) { return }
+        totalsInFlight.insert(path)
+        totalsQueue.async {
+            let measured = try? Vault.totals(vault)
+            DispatchQueue.main.async {
+                self.totalsInFlight.remove(path)
+                guard self.selection == libraryID, let measured else { return }
+                self.totals = measured
+                TotalsMemory.write(path, measured)
+            }
+            let heads = (try? Vault.listHeads(vault)) ?? []
+            let shown = Vault.rowGlances(vault: vault, heads: heads)
+            DispatchQueue.main.async {
+                guard self.selection == libraryID else { return }
+                self.glances = shown
+            }
+        }
+    }
+
+    private func runSearch(vault: URL, id: String, libraryID: String, query: String, ticket: Int) {
+        browse.async {
+            let tree: [FileTree.Node]
+            do {
+                let found = try Vault.findEntries(vault, id, query)
+                tree = FileTree.make(rows: found.rows, folders: found.folders, query: "")
+            } catch {
+                DispatchQueue.main.async {
+                    guard ticket == self.searchTicket else { return }
+                    self.searching = false
+                    self.searchTree = []
+                    if !self.busy { self.banner = error.localizedDescription }
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                guard ticket == self.searchTicket, self.selection == libraryID, self.selectedSnapshotID == id else { return }
+                let current = self.filter.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard current.lowercased() == query.lowercased() else { return }
+                self.searching = false
+                self.searchTree = tree
+            }
+        }
+    }
+
+    private func searchRow(_ path: String) -> BrowserRow? {
+        var pending = searchTree
+        while let node = pending.popLast() {
+            if node.path == path { return node.row }
+            if let children = node.children {
+                pending.append(contentsOf: children)
+            }
+        }
+        return nil
+    }
+
+    private func searchTreeHasFolder(_ path: String) -> Bool {
+        var pending = searchTree
+        while let node = pending.popLast() {
+            if node.path == path { return node.children != nil }
+            if let children = node.children {
+                pending.append(contentsOf: children)
+            }
+        }
+        return false
     }
 
     func deleteSelectedSnapshot() {
@@ -1317,5 +1555,29 @@ final class AppModel: ObservableObject {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HHmm"
         return formatter.string(from: date)
+    }
+}
+
+/// The last stored-byte count for each vault, so the header can show it before the next walk.
+private enum TotalsMemory {
+    static let key = "chronicle.totalsCache"
+
+    static func read(_ path: String) -> VaultTotals? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let stored = try? JSONDecoder().decode([String: VaultTotals].self, from: data) else {
+            return nil
+        }
+        return stored[path]
+    }
+
+    static func write(_ path: String, _ totals: VaultTotals) {
+        var stored: [String: VaultTotals] = [:]
+        if let data = UserDefaults.standard.data(forKey: key),
+           let decoded = try? JSONDecoder().decode([String: VaultTotals].self, from: data) {
+            stored = decoded
+        }
+        stored[path] = totals
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }

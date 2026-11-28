@@ -3,6 +3,7 @@ import Foundation
 enum CLI {
     static let help = """
     Chronicle — a personal time machine
+    \(AppInfo.author) — \(AppInfo.github)
 
     Each version stores only what changed. History lives in a vault you name.
     The watched folder is only read.

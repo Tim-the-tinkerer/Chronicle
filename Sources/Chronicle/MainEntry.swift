@@ -19,7 +19,7 @@ struct MainEntry {
             exit(0)
         }
         if userArgs.contains("--version") {
-            print("\(AppInfo.name) \(AppInfo.version) (\(AppInfo.build))")
+            print("\(AppInfo.name) \(AppInfo.version) (\(AppInfo.build)) — \(AppInfo.github)")
             exit(0)
         }
         if !userArgs.isEmpty {
@@ -205,17 +205,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func storeSnapshots(_ sender: Any?) { model.chooseSnapshotPlace() }
 
     @objc private func showAbout(_ sender: Any?) {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let credits = NSMutableAttributedString(
+            string: "A personal time machine. Each version stores only what changed.\n",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: style,
+            ]
+        )
+        credits.append(NSAttributedString(
+            string: AppInfo.author,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .link: URL(string: AppInfo.github)!,
+                .foregroundColor: NSColor.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .paragraphStyle: style,
+            ]
+        ))
         let options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationName: AppInfo.name,
-            .version: AppInfo.version,
-            .applicationVersion: "Version \(AppInfo.version) (\(AppInfo.build))",
-            .credits: NSAttributedString(
-                string: "A personal time machine. Each version stores only what changed.",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                    .foregroundColor: NSColor.secondaryLabelColor,
-                ]
-            ),
+            .applicationVersion: AppInfo.version,
+            .version: AppInfo.build,
+            .credits: credits,
         ]
         NSApp.orderFrontStandardAboutPanel(options: options)
     }

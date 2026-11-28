@@ -4,7 +4,9 @@ A personal time machine for one folder at a time. Chronicle watches the folder a
 
 The cost of a full copy, times the number of versions, is what history usually costs. Chronicle keeps the new bytes.
 
-**Version:** 1.0.33 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
+**Version:** 1.0.34 — see [CHANGELOG.md](CHANGELOG.md). The vault format is [FORMAT.md](FORMAT.md), `CHRONICLE/1`.
+
+**GitHub:** [Tim-the-tinkerer](https://github.com/Tim-the-tinkerer)
 
 ## What you see
 

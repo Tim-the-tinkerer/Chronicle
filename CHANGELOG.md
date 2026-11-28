@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.34
+
+- About names Tim-the-tinkerer and links to that GitHub profile.
+
 ## 1.0.33
 
 - Reopening Chronicle reads each version header once. Launch maintenance reloads the version list only when it removed a version.
